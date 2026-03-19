@@ -34,11 +34,20 @@ def fetch_ohlcv(
     if df.empty:
         raise ValueError(f"No data returned for {ticker} ({interval}, {lookback_days}d)")
 
-    # Flatten multi-level columns if present
+    # Flatten multi-level columns (yfinance ≥1.0 always returns MultiIndex)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+    # Deduplicate column names after flattening
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated()]
+
+    expected = ["Open", "High", "Low", "Close", "Volume"]
+    missing = [c for c in expected if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns after download: {missing}")
+
+    df = df[expected].copy()
     df.dropna(inplace=True)
     return df
 

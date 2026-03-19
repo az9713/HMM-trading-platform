@@ -25,8 +25,18 @@ A Python-based stock research platform using **Hidden Markov Models** for market
 ## Quick Start
 
 ```bash
+python -m venv .venv
+
+# Activate the virtual environment
+# Git Bash on Windows:
+source .venv/Scripts/activate
+# cmd/PowerShell on Windows:
+.venv\Scripts\activate
+# Linux / Mac:
+source .venv/bin/activate
+
 pip install -r requirements.txt
-streamlit run app.py
+python -m streamlit run app.py
 ```
 
 ## Project Structure

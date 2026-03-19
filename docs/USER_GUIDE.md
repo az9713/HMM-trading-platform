@@ -31,6 +31,16 @@
 ```bash
 git clone https://github.com/az9713/HMM-trading-platform.git
 cd HMM-trading-platform
+python -m venv .venv
+
+# Activate the virtual environment
+# Git Bash on Windows:
+source .venv/Scripts/activate
+# cmd/PowerShell on Windows:
+.venv\Scripts\activate
+# Linux / Mac:
+source .venv/bin/activate
+
 pip install -r requirements.txt
 ```
 
@@ -53,7 +63,7 @@ pip install -r requirements.txt
 ## Quick Start
 
 ```bash
-streamlit run app.py
+python -m streamlit run app.py
 ```
 
 This opens the dashboard in your browser (default: `http://localhost:8501`).

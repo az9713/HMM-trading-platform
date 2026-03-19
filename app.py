@@ -113,8 +113,13 @@ if run_btn:
     feature_cols = config["data"]["features"]
 
     with st.spinner("Fetching data..."):
-        df = fetch_ohlcv(ticker, interval, lookback)
-        df = compute_features(df, config["data"])
+        try:
+            df = fetch_ohlcv(ticker, interval, lookback)
+            df = compute_features(df, config["data"])
+        except (ValueError, Exception) as e:
+            st.error(f"Failed to fetch data: {e}")
+            st.info("Check that the ticker is valid on Yahoo Finance (e.g., GOOG not GOOGL, BTC-USD not BTC).")
+            st.stop()
 
     st.success(f"Loaded {len(df)} bars for {ticker} ({interval})")
 
@@ -166,11 +171,16 @@ if run_btn:
         with col1:
             st.markdown(f"### Regime: **{regime.upper()}**")
             st.markdown(f"<div style='background:{get_regime_color(regime)};padding:20px;"
-                        f"border-radius:10px;text-align:center;color:white;font-size:24px'>"
+                        f"border-radius:10px;text-align:center;color:white;font-size:24px;"
+                        f"font-weight:bold'>"
                         f"{regime.upper()}</div>", unsafe_allow_html=True)
         with col2:
             st.metric("Confidence", f"{conf_pct:.1f}%")
-            st.metric("Signal", signal_text)
+            signal_bg = {1: "#388e3c", -1: "#d32f2f", 0: "#616161"}.get(signal_val, "#616161")
+            st.markdown(f"<div style='padding:8px 16px;border-radius:8px;background:{signal_bg};"
+                        f"color:white;font-size:20px;font-weight:bold;text-align:center;"
+                        f"margin-top:4px'>{signal_text}</div>",
+                        unsafe_allow_html=True)
         with col3:
             pos_size = sig_gen.compute_position_size(last["confidence"])
             st.metric("Position Size", f"{pos_size:.1%}")
