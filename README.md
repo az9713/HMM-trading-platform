@@ -25,8 +25,8 @@ A Python-based stock research platform using **Hidden Markov Models** for market
 ## Quick Start
 
 ```bash
-git clone https://github.com/az9713/HMM-trading-platform.git
-cd HMM-trading-platform
+git clone https://github.com/az9713/HMM-regime-terminal.git
+cd HMM-regime-terminal
 
 # Create virtual environment
 python -m venv .venv

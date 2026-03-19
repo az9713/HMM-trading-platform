@@ -69,8 +69,8 @@ All packages are installed automatically from requirements.txt.
 
 ```bash
 # Clone the repository
-git clone https://github.com/az9713/HMM-trading-platform.git
-cd HMM-trading-platform
+git clone https://github.com/az9713/HMM-regime-terminal.git
+cd HMM-regime-terminal
 
 # Create a virtual environment
 python -m venv .venv
@@ -89,8 +89,8 @@ python -m streamlit run app.py
 
 ```cmd
 :: Clone the repository
-git clone https://github.com/az9713/HMM-trading-platform.git
-cd HMM-trading-platform
+git clone https://github.com/az9713/HMM-regime-terminal.git
+cd HMM-regime-terminal
 
 :: Create a virtual environment
 python -m venv .venv
@@ -109,8 +109,8 @@ python -m streamlit run app.py
 
 ```bash
 # Clone the repository
-git clone https://github.com/az9713/HMM-trading-platform.git
-cd HMM-trading-platform
+git clone https://github.com/az9713/HMM-regime-terminal.git
+cd HMM-regime-terminal
 
 # Create a virtual environment
 python3 -m venv .venv
@@ -129,8 +129,8 @@ python -m streamlit run app.py
 
 ```bash
 # Clone the repository
-git clone https://github.com/az9713/HMM-trading-platform.git
-cd HMM-trading-platform
+git clone https://github.com/az9713/HMM-regime-terminal.git
+cd HMM-regime-terminal
 
 # Create a virtual environment
 python3 -m venv .venv
