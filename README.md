@@ -72,13 +72,35 @@ app.py           # Streamlit dashboard (5 tabs)
 | Shannon entropy | `H = -sum(p_i * log2(p_i))` | Regime uncertainty per bar |
 | Expected duration | `E[d_i] = 1/(1-a_ii)` | How long regimes persist |
 | Kelly criterion | `f* = (p*b-q)/b` | Optimal sizing from edge |
-| CVaR (5%) | `E[r | r <= VaR_5%]` | Tail risk beyond VaR |
+| CVaR (5%) | `E[r \| r <= VaR_5%]` | Tail risk beyond VaR |
 | Entropy scaling | `size * (1 - H/H_max)` | Reduce bets when uncertain |
 
 ## Configuration
 
 All parameters are in `config.yaml` -- data settings, HMM hyperparameters, strategy thresholds, risk limits, and backtest windows. The sidebar in the Streamlit app overrides these at runtime. See the [User Guide](docs/USER_GUIDE.md) for a complete parameter reference.
 
-## Research
+## Acknowledgements
 
-The `docs/` folder contains 11 academic papers and a YouTube transcript that informed the mathematical approach. See the [Theory](docs/THEORY.md) document for details on how each mathematical concept is applied.
+### Inspiration
+
+This project was inspired by the YouTube video **["How To Actually Use Claude Code for Trading Strategies (Like a Quant)"](https://www.youtube.com/watch?v=EUSXhJNwRqI&t=459s)**, which demonstrates building a "Regime Terminal" using HMMs for market regime detection. This implementation goes significantly deeper into the mathematics, adding BIC model selection, Shannon entropy confidence, Kelly criterion sizing, walk-forward backtesting, and bootstrap confidence intervals.
+
+### Academic Papers
+
+The following papers in `docs/` informed the mathematical approach and implementation:
+
+| Paper | Authors | Topic |
+|-------|---------|-------|
+| `1199600.pdf` | Ji, Neerchal | Creating stock portfolios using Hidden Markov Models |
+| `2310.03775v2.pdf` | Catello, Ruggiero, Schiavone, Valentino | HMMs for stock market prediction (Univ. Federico II) |
+| `2407.19858v7.pdf` | Monteiro | AI-powered energy algorithmic trading: integrating HMMs with neural networks |
+| `AdrovicCinoProenca.pdf` | Adrovic, Di Cino, Proenca | Stock trading with Hidden Markov Models (experimental mathematics) |
+| `Trading_Strategy_for_Market_Situation_Estimation_B.pdf` | Chen, Yi, Zhao | Trading strategy for market situation estimation based on HMM |
+| `Wisebourt_Shaul.pdf` | Wisebourt | Hierarchical HMM of high-frequency market regimes (Univ. Waterloo, MQF thesis) |
+| `djk_20190217.pdf` | Daniel, Jagannathan, Kim | A Hidden Markov Model of momentum |
+| `jfallon_hmm_stock.pdf` | Fallon | Making profit in the stock market using HMMs (UMass Lowell) |
+| `p3D_2.pdf` | Wu, Siwasarit | Capturing order imbalance with HMM: SET50 and KOSPI50 (Thammasat Univ.) |
+| `resumo.pdf` | (authors in PDF) | Algorithmic stock index trading using discrete HMMs with daily/weekly windows |
+| `stock_hmm.pdf` | (authors in PDF) | Stock market prediction using Hidden Markov Models |
+
+See the [Theory](docs/THEORY.md) document for details on how each mathematical concept from these papers is applied in the codebase.
