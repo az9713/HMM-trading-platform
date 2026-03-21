@@ -18,6 +18,7 @@ from hmm_engine import RegimeDetector
 from strategy import SignalGenerator
 from backtester import WalkForwardBacktester
 from fundamentals import FundamentalAnalyzer
+from regime_analyzer import RegimeTransitionAnalyzer
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -520,9 +521,9 @@ if run_btn:
 
     # ── Tabs ─────────────────────────────────────────────────────────────
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "Current Signal", "Regime Analysis", "Backtest Results",
-        "Trade Log", "Model Diagnostics", "Fundamentals"
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "Current Signal", "Regime Analysis", "Regime Transitions",
+        "Backtest Results", "Trade Log", "Model Diagnostics", "Fundamentals"
     ])
 
     # ── Tab 1: Current Signal ────────────────────────────────────────────
@@ -644,9 +645,208 @@ if run_btn:
                               yaxis_title="Information Criterion")
         st.plotly_chart(fig_bic, use_container_width=True)
 
-    # ── Tab 3: Backtest Results ──────────────────────────────────────────
+    # ── Tab 3: Regime Transitions ────────────────────────────────────────
 
     with tab3:
+        st.subheader("Regime Transition Alpha Engine")
+
+        trans_analyzer = RegimeTransitionAnalyzer()
+        transitions = trans_analyzer.detect_transitions(
+            states, labels, df["Close"].values, entropy, confidence
+        )
+
+        if not transitions:
+            st.info("No regime transitions detected in the current data.")
+        else:
+            # ── Transition timing summary ──
+            timing = trans_analyzer.transition_timing_analysis(transitions)
+            tc1, tc2, tc3, tc4 = st.columns(4)
+            with tc1:
+                st.metric("Total Transitions", timing["n_transitions"])
+            with tc2:
+                avg_gap = timing["avg_bars_between"]
+                st.metric("Avg Bars Between", f"{avg_gap:.0f}" if not np.isnan(avg_gap) else "N/A")
+            with tc3:
+                ent_pct = timing["entropy_precedes_transition"]
+                st.metric("Entropy Precedes %", f"{ent_pct:.0%}" if not np.isnan(ent_pct) else "N/A")
+            with tc4:
+                avg_conf = timing["avg_confidence_at_transition"]
+                st.metric("Avg Confidence at Transition", f"{avg_conf:.1%}" if not np.isnan(avg_conf) else "N/A")
+
+            # ── Forward returns by transition type ──
+            st.subheader("Transition-Conditional Forward Returns")
+            fwd_df = trans_analyzer.transition_forward_returns(transitions)
+            if not fwd_df.empty:
+                display_fwd = fwd_df.copy()
+                display_fwd["transition"] = display_fwd["from_regime"] + " → " + display_fwd["to_regime"]
+                display_fwd = display_fwd[["transition", "count", "mean_fwd_5", "mean_fwd_10",
+                                            "mean_fwd_20", "hit_rate_5"]]
+                for col in ["mean_fwd_5", "mean_fwd_10", "mean_fwd_20", "hit_rate_5"]:
+                    display_fwd[col] = display_fwd[col].apply(
+                        lambda x: f"{x:.4f}" if not np.isnan(x) else "N/A"
+                    )
+                display_fwd.columns = ["Transition", "Count", "Fwd 5-bar", "Fwd 10-bar",
+                                       "Fwd 20-bar", "Hit Rate (5-bar)"]
+                st.dataframe(display_fwd, use_container_width=True, hide_index=True)
+
+                # Bar chart of forward returns
+                chart_fwd = fwd_df.copy()
+                chart_fwd["transition"] = chart_fwd["from_regime"] + " → " + chart_fwd["to_regime"]
+                fig_fwd = go.Figure()
+                for w, col, color in [(5, "mean_fwd_5", "#00e599"), (10, "mean_fwd_10", "#3b82f6"),
+                                       (20, "mean_fwd_20", "#f59e0b")]:
+                    fig_fwd.add_trace(go.Bar(
+                        x=chart_fwd["transition"], y=chart_fwd[col],
+                        name=f"{w}-bar", marker_color=color,
+                    ))
+                fig_fwd.update_layout(
+                    barmode="group", height=400,
+                    yaxis_title="Mean Forward Return",
+                    xaxis_title="Transition Type",
+                )
+                st.plotly_chart(fig_fwd, use_container_width=True)
+
+            # ── Empirical transition frequency matrix ──
+            st.subheader("Empirical Transition Frequency")
+            unique_labels = sorted(set(labels.values()))
+            emp_matrix = trans_analyzer.transition_matrix_empirical(transitions, unique_labels)
+            fig_emp = px.imshow(
+                emp_matrix.values,
+                labels=dict(x="To Regime", y="From Regime", color="Count"),
+                x=unique_labels, y=unique_labels,
+                color_continuous_scale="Greens",
+                text_auto=True,
+            )
+            fig_emp.update_layout(height=400)
+            st.plotly_chart(fig_emp, use_container_width=True)
+
+            # ── Early warning signals ──
+            st.subheader("Early Warning Signals")
+            warnings_df = trans_analyzer.early_warning_signals(
+                posteriors, entropy, states, labels,
+            )
+            if not warnings_df.empty:
+                # Plot entropy gradient and posterior gap with warning highlights
+                fig_warn = make_subplots(
+                    rows=2, cols=1, shared_xaxes=True,
+                    subplot_titles=["Entropy Gradient (rising = uncertainty)", "Posterior Gap (falling = transition brewing)"],
+                    vertical_spacing=0.08,
+                )
+                warn_x = warnings_df["bar"].values
+                if "Datetime" in df.columns:
+                    warn_x_vals = df["Datetime"].iloc[warnings_df["bar"].values].values
+                else:
+                    warn_x_vals = warnings_df["bar"].values
+
+                # Entropy gradient
+                fig_warn.add_trace(go.Scatter(
+                    x=warn_x_vals, y=warnings_df["entropy_gradient"],
+                    mode="lines", name="Entropy Gradient",
+                    line=dict(color="#f59e0b"),
+                ), row=1, col=1)
+
+                # Posterior gap
+                fig_warn.add_trace(go.Scatter(
+                    x=warn_x_vals, y=warnings_df["posterior_gap"],
+                    mode="lines", name="Posterior Gap",
+                    line=dict(color="#06b6d4"),
+                ), row=2, col=1)
+
+                # Mark transition points
+                trans_bars = [tr.bar for tr in transitions if tr.bar in warnings_df["bar"].values]
+                if trans_bars:
+                    if "Datetime" in df.columns:
+                        trans_x = df["Datetime"].iloc[trans_bars].values
+                    else:
+                        trans_x = trans_bars
+                    for row_num in [1, 2]:
+                        fig_warn.add_trace(go.Scatter(
+                            x=trans_x,
+                            y=[0] * len(trans_bars),
+                            mode="markers",
+                            marker=dict(color="red", size=10, symbol="triangle-up"),
+                            name="Transition" if row_num == 1 else None,
+                            showlegend=(row_num == 1),
+                        ), row=row_num, col=1)
+
+                # Highlight high-warning zones
+                high_warn = warnings_df[warnings_df["warning_level"] >= 2]
+                if not high_warn.empty:
+                    if "Datetime" in df.columns:
+                        hw_x = df["Datetime"].iloc[high_warn["bar"].values].values
+                    else:
+                        hw_x = high_warn["bar"].values
+                    fig_warn.add_trace(go.Scatter(
+                        x=hw_x,
+                        y=high_warn["entropy_gradient"],
+                        mode="markers",
+                        marker=dict(color="red", size=6, opacity=0.5),
+                        name="High Warning",
+                    ), row=1, col=1)
+
+                fig_warn.update_layout(height=500)
+                st.plotly_chart(fig_warn, use_container_width=True)
+
+            # ── Regime P&L Attribution ──
+            st.subheader("Regime P&L Attribution")
+            returns_arr = df["Close"].pct_change().fillna(0).values
+            attr_df = trans_analyzer.regime_attribution(
+                returns_arr, states, labels, signals.values,
+            )
+            if not attr_df.empty:
+                # Summary metrics
+                attr_cols = st.columns(len(attr_df))
+                for i, (_, row) in enumerate(attr_df.iterrows()):
+                    with attr_cols[i % len(attr_cols)]:
+                        regime_name = row["regime"]
+                        color = get_regime_color(regime_name)
+                        st.markdown(
+                            f"<div style='border-left:4px solid {color};"
+                            f"padding:8px 12px;margin-bottom:12px'>"
+                            f"<span style='color:#888;font-size:11px'>{regime_name.upper()}</span><br>"
+                            f"<span style='font-size:16px;font-weight:bold'>"
+                            f"PnL: {row['cumulative_return']:.4f}</span><br>"
+                            f"<span style='font-size:12px;color:#aaa'>"
+                            f"Sharpe: {row['sharpe']:.2f} | "
+                            f"Win: {row['win_rate']:.0%} | "
+                            f"Time: {row['pct_time']:.0%}</span>"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                # PnL contribution pie chart
+                fig_pie = go.Figure(data=[go.Pie(
+                    labels=attr_df["regime"],
+                    values=attr_df["cumulative_return"].abs(),
+                    marker=dict(colors=[get_regime_color(r) for r in attr_df["regime"]]),
+                    textinfo="label+percent",
+                    hole=0.4,
+                )])
+                fig_pie.update_layout(height=350, title="PnL Contribution by Regime")
+                st.plotly_chart(fig_pie, use_container_width=True)
+
+                # Alpha by regime bar chart
+                fig_alpha = go.Figure()
+                fig_alpha.add_trace(go.Bar(
+                    x=attr_df["regime"], y=attr_df["cumulative_return"],
+                    name="Strategy Return",
+                    marker_color=[get_regime_color(r) for r in attr_df["regime"]],
+                ))
+                fig_alpha.add_trace(go.Bar(
+                    x=attr_df["regime"], y=attr_df["market_return"],
+                    name="Market Return",
+                    marker_color="rgba(128,128,128,0.5)",
+                ))
+                fig_alpha.update_layout(
+                    barmode="group", height=350,
+                    yaxis_title="Cumulative Return",
+                    title="Strategy vs Market Return by Regime",
+                )
+                st.plotly_chart(fig_alpha, use_container_width=True)
+
+    # ── Tab 4: Backtest Results ──────────────────────────────────────────
+
+    with tab4:
         with st.spinner("Running walk-forward backtest..."):
             backtester = WalkForwardBacktester(config)
             try:
@@ -712,9 +912,9 @@ if run_btn:
             except ValueError as e:
                 st.error(str(e))
 
-    # ── Tab 4: Trade Log ─────────────────────────────────────────────────
+    # ── Tab 5: Trade Log ─────────────────────────────────────────────────
 
-    with tab4:
+    with tab5:
         st.subheader("Trade Log")
         if "bt_result" in dir() and bt_result.trades:
             trade_data = []
@@ -735,9 +935,9 @@ if run_btn:
         else:
             st.info("Run backtest to see trade log.")
 
-    # ── Tab 5: Model Diagnostics ─────────────────────────────────────────
+    # ── Tab 6: Model Diagnostics ─────────────────────────────────────────
 
-    with tab5:
+    with tab6:
         col1, col2 = st.columns(2)
 
         with col1:
@@ -778,9 +978,9 @@ if run_btn:
         fig_corr.update_layout(height=400)
         st.plotly_chart(fig_corr, use_container_width=True)
 
-    # ── Tab 6: Fundamentals ─────────────────────────────────────────────
+    # ── Tab 7: Fundamentals ─────────────────────────────────────────────
 
-    with tab6:
+    with tab7:
         if FundamentalAnalyzer.is_crypto(ticker):
             st.warning("Fundamental analysis is not available for crypto assets. "
                        "Crypto tickers do not have traditional financial statements, "

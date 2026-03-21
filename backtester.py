@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from data_loader import standardize, get_feature_matrix
 from hmm_engine import RegimeDetector
 from strategy import SignalGenerator
+from regime_analyzer import RegimeTransitionAnalyzer
 
 
 @dataclass
@@ -39,6 +40,7 @@ class BacktestResult:
     confidence_series: pd.Series = None
     ci_lower: dict = field(default_factory=dict)
     ci_upper: dict = field(default_factory=dict)
+    regime_attribution: pd.DataFrame = None
 
 
 class WalkForwardBacktester:
@@ -153,6 +155,22 @@ class WalkForwardBacktester:
         ci_lo, ci_hi = self.bootstrap_confidence_intervals(equity)
         result.ci_lower = ci_lo
         result.ci_upper = ci_hi
+
+        # Regime attribution
+        returns = df["Close"].pct_change().fillna(0).values
+        state_ids = np.array([
+            next((s for s, l in {} .items() if l == r), 0)
+            for r in all_regimes.values
+        ])
+        regime_labels_map = {i: lab for i, lab in enumerate(sorted(set(all_regimes.values)))}
+        # Build a simple integer state array from regime labels
+        label_to_int = {lab: i for i, lab in enumerate(sorted(set(all_regimes.values)))}
+        int_states = np.array([label_to_int.get(r, 0) for r in all_regimes.values])
+
+        analyzer = RegimeTransitionAnalyzer()
+        result.regime_attribution = analyzer.regime_attribution(
+            returns, int_states, regime_labels_map, all_signals.values,
+        )
 
         return result
 
