@@ -19,6 +19,7 @@ from strategy import SignalGenerator
 from backtester import WalkForwardBacktester
 from fundamentals import FundamentalAnalyzer
 from regime_analyzer import RegimeTransitionAnalyzer
+from multi_timeframe import run_multi_timeframe_analysis, TIMEFRAME_ORDER, DEFAULT_WEIGHTS
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -438,6 +439,16 @@ with st.sidebar:
     step_bars = st.slider("Step size (bars)", 10, 200,
                           base_config["backtest"]["step_bars"], 10)
 
+    st.header("Multi-Timeframe")
+    enable_mtf = st.checkbox("Enable Multi-Timeframe Fusion", False)
+    mtf_intervals_options = ["1m", "5m", "15m", "1h", "1d"]
+    mtf_intervals = st.multiselect(
+        "Timeframes to fuse",
+        mtf_intervals_options,
+        default=["1h", "1d"],
+        help="Select 2+ timeframes. Base (fastest) is used as primary timeline.",
+    )
+
     run_btn = st.button("Run Analysis", type="primary", use_container_width=True)
 
 # ── Build runtime config ─────────────────────────────────────────────────────
@@ -521,9 +532,10 @@ if run_btn:
 
     # ── Tabs ─────────────────────────────────────────────────────────────
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
         "Current Signal", "Regime Analysis", "Regime Transitions",
-        "Backtest Results", "Trade Log", "Model Diagnostics", "Fundamentals"
+        "Backtest Results", "Trade Log", "Model Diagnostics", "Fundamentals",
+        "Multi-Timeframe",
     ])
 
     # ── Tab 1: Current Signal ────────────────────────────────────────────
@@ -1281,6 +1293,152 @@ if run_btn:
             if not earnings_df.empty:
                 with st.expander("Earnings Dates"):
                     st.dataframe(earnings_df, use_container_width=True)
+
+    # ── Tab 8: Multi-Timeframe Fusion ────────────────────────────────────
+
+    with tab8:
+        if not enable_mtf:
+            st.info("Enable **Multi-Timeframe Fusion** in the sidebar and select 2+ timeframes to use this tab.")
+        elif len(mtf_intervals) < 2:
+            st.warning("Select at least 2 timeframes in the sidebar.")
+        else:
+            with st.spinner("Fitting HMMs across multiple timeframes..."):
+                try:
+                    fusion = run_multi_timeframe_analysis(
+                        ticker=ticker,
+                        intervals=mtf_intervals,
+                        lookback_days=lookback,
+                        config=config,
+                    )
+                except Exception as e:
+                    st.error(f"Multi-timeframe analysis failed: {e}")
+                    fusion = None
+
+            if fusion is not None:
+                st.subheader("Cross-Timeframe Regime Confluence")
+
+                # ── Confluence score time series ──
+                fig_conf = go.Figure()
+                conf_idx = fusion.aligned_regimes.index
+                fig_conf.add_trace(go.Scatter(
+                    x=conf_idx, y=fusion.confluence_score,
+                    mode="lines", name="Confluence Score",
+                    line=dict(color="#00e599", width=2),
+                    fill="tozeroy", fillcolor="rgba(0,229,153,0.1)",
+                ))
+                fig_conf.add_hline(y=0.7, line_dash="dash", line_color="#f59e0b",
+                                   annotation_text="Strong agreement (0.7)")
+                fig_conf.update_layout(
+                    title="Regime Confluence Score (higher = more timeframe agreement)",
+                    yaxis=dict(title="Confluence", range=[0, 1.05]),
+                    xaxis_title="Time", height=350,
+                    template="plotly_dark",
+                )
+                st.plotly_chart(fig_conf, use_container_width=True)
+
+                # ── Per-timeframe regime strips ──
+                st.subheader("Regime Alignment Across Timeframes")
+                regime_color_map = {
+                    "crash": "#d32f2f", "bear": "#f57c00", "neutral": "#9e9e9e",
+                    "bull": "#388e3c", "bull_run": "#1565c0", "unknown": "#e0e0e0",
+                }
+                fig_strips = make_subplots(
+                    rows=len(mtf_intervals), cols=1,
+                    shared_xaxes=True,
+                    subplot_titles=[f"{iv} Regime" for iv in sorted(
+                        mtf_intervals,
+                        key=lambda x: TIMEFRAME_ORDER.index(x) if x in TIMEFRAME_ORDER else 99,
+                    )],
+                    vertical_spacing=0.04,
+                )
+                sorted_ivs = sorted(
+                    mtf_intervals,
+                    key=lambda x: TIMEFRAME_ORDER.index(x) if x in TIMEFRAME_ORDER else 99,
+                )
+                for row_i, iv in enumerate(sorted_ivs, 1):
+                    col_name = f"regime_{iv}"
+                    if col_name in fusion.aligned_regimes.columns:
+                        regimes_series = fusion.aligned_regimes[col_name].fillna("unknown")
+                        colors = [regime_color_map.get(r, "#e0e0e0") for r in regimes_series]
+                        from multi_timeframe import _regime_to_sentiment
+                        sentiments = [_regime_to_sentiment(r) for r in regimes_series]
+                        fig_strips.add_trace(go.Bar(
+                            x=conf_idx, y=[1] * len(conf_idx),
+                            marker_color=colors,
+                            showlegend=False,
+                            hovertext=[f"{iv}: {r}" for r in regimes_series],
+                            hoverinfo="text",
+                        ), row=row_i, col=1)
+                        fig_strips.update_yaxes(visible=False, row=row_i, col=1)
+
+                fig_strips.update_layout(
+                    height=120 * len(mtf_intervals) + 50,
+                    template="plotly_dark",
+                    bargap=0, bargroupgap=0,
+                    title_text="Regime State per Timeframe (aligned to base timeline)",
+                )
+                st.plotly_chart(fig_strips, use_container_width=True)
+
+                # ── Enhanced vs base confidence ──
+                st.subheader("Enhanced Confidence (Base × Confluence)")
+                base_tf = fusion.base_interval
+                base_result = fusion.timeframe_results[base_tf]
+                fig_enh = go.Figure()
+                fig_enh.add_trace(go.Scatter(
+                    x=conf_idx, y=base_result.confidence,
+                    mode="lines", name="Base Confidence",
+                    line=dict(color="#3b82f6", width=1.5, dash="dot"),
+                ))
+                fig_enh.add_trace(go.Scatter(
+                    x=conf_idx, y=fusion.enhanced_confidence,
+                    mode="lines", name="Enhanced Confidence",
+                    line=dict(color="#00e599", width=2),
+                ))
+                fig_enh.update_layout(
+                    title="Confidence: Single-TF vs Multi-TF Enhanced",
+                    yaxis=dict(title="Confidence", range=[0, 1.05]),
+                    xaxis_title="Time", height=300,
+                    template="plotly_dark",
+                )
+                st.plotly_chart(fig_enh, use_container_width=True)
+
+                # ── Dominant regime + conflict summary ──
+                st.subheader("Dominant Regime (Weighted Vote)")
+                col_a, col_b, col_c = st.columns(3)
+                with col_a:
+                    current_dominant = fusion.dominant_regime.iloc[-1]
+                    dom_color = regime_color_map.get(current_dominant, "#e0e0e0")
+                    st.markdown(
+                        f"<div style='background:{dom_color};padding:20px;border-radius:10px;"
+                        f"text-align:center;color:white;font-size:20px;font-weight:bold'>"
+                        f"{current_dominant.upper()}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    st.caption("Current dominant regime across all timeframes")
+                with col_b:
+                    avg_conf = float(np.mean(fusion.confluence_score[-20:]))
+                    st.metric("Avg Confluence (last 20 bars)", f"{avg_conf:.1%}")
+                with col_c:
+                    n_conflicts = int(fusion.regime_conflicts["conflict"].sum())
+                    total_bars = len(fusion.regime_conflicts)
+                    st.metric("Conflict Bars", f"{n_conflicts}/{total_bars}",
+                              delta=f"{n_conflicts/max(total_bars,1)*100:.0f}%",
+                              delta_color="inverse")
+
+                # ── Per-timeframe HMM summary ──
+                st.subheader("Per-Timeframe HMM Summary")
+                summary_rows = []
+                for iv in sorted_ivs:
+                    tf_r = fusion.timeframe_results[iv]
+                    summary_rows.append({
+                        "Timeframe": iv,
+                        "N States (BIC)": tf_r.n_states,
+                        "Bars": len(tf_r.df),
+                        "Current Regime": tf_r.labels.get(tf_r.states[-1], "unknown"),
+                        "Avg Confidence": f"{tf_r.confidence.mean():.2%}",
+                        "Weight": f"{DEFAULT_WEIGHTS.get(iv, 0.5):.1f}",
+                    })
+                st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
 
 else:
     # ── Landing Page ─────────────────────────────────────────────────────

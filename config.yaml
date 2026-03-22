@@ -52,6 +52,17 @@ risk:
   stop_loss_pct: 0.05
   take_profit_pct: 0.15
 
+multi_timeframe:
+  enabled: false
+  intervals: ["1h", "1d"]         # timeframes to fuse (fastest first)
+  weights:                         # confluence weights (higher = more influence)
+    1m: 0.3
+    5m: 0.4
+    15m: 0.5
+    1h: 0.6
+    1d: 1.0
+    1wk: 1.2
+
 backtest:
   train_window_bars: 500
   test_window_bars: 100
