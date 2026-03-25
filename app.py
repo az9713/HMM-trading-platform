@@ -21,6 +21,7 @@ from fundamentals import FundamentalAnalyzer
 from regime_analyzer import RegimeTransitionAnalyzer
 from multi_timeframe import run_multi_timeframe_analysis, TIMEFRAME_ORDER, DEFAULT_WEIGHTS
 from monte_carlo import MonteCarloEngine
+from regime_predictor import RegimePredictor
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -533,10 +534,10 @@ if run_btn:
 
     # ── Tabs ─────────────────────────────────────────────────────────────
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "Current Signal", "Regime Analysis", "Regime Transitions",
         "Backtest Results", "Trade Log", "Model Diagnostics", "Fundamentals",
-        "Multi-Timeframe", "Monte Carlo",
+        "Multi-Timeframe", "Monte Carlo", "Regime Prediction",
     ])
 
     # ── Tab 1: Current Signal ────────────────────────────────────────────
@@ -1720,6 +1721,284 @@ if run_btn:
                             st.metric("VaR (95%)", f"{sr.var_95:+.2%}")
                         with sc_col3:
                             st.metric("Worst MDD", f"{sr.max_drawdowns.min():.2%}")
+
+    # ── Tab 10: Regime Prediction (BOCD + Forecasting) ──────────────────
+
+    with tab10:
+        st.subheader("Regime Prediction Engine")
+        st.caption(
+            "Bayesian Online Change Point Detection fused with HMM regime forecasting. "
+            "Detects regime shifts earlier than Viterbi decoding and projects future "
+            "regime probabilities using the learned transition matrix."
+        )
+
+        pred_col1, pred_col2, pred_col3 = st.columns(3)
+        with pred_col1:
+            pred_hazard = st.slider(
+                "Hazard Rate (1/\u03bb)", 0.001, 0.1, 0.01, 0.001,
+                key="pred_hazard",
+                help="Prior probability of a change point at each bar. Lower = expect longer regimes."
+            )
+        with pred_col2:
+            pred_horizon = st.number_input(
+                "Forecast Horizon (bars)", 5, 100, 20, step=5, key="pred_horizon"
+            )
+        with pred_col3:
+            pred_threshold = st.slider(
+                "CP Detection Threshold", 0.1, 0.8, 0.3, 0.05,
+                key="pred_threshold",
+                help="Minimum change point probability to flag as detected"
+            )
+
+        pred_run = st.button("Run Regime Prediction", type="primary", key="pred_run")
+
+        if pred_run:
+            with st.spinner("Running Bayesian Online Change Point Detection..."):
+                pred_config = config.copy()
+                pred_config["prediction"] = {
+                    "hazard_rate": pred_hazard,
+                    "forecast_horizon": pred_horizon,
+                    "changepoint_threshold": pred_threshold,
+                    "max_run_length": 300,
+                    "blend_weight_bocd": 0.6,
+                    "blend_weight_entropy": 0.4,
+                }
+                predictor_engine = RegimePredictor(pred_config)
+
+                pred_summary = predictor_engine.generate_forecast_summary(
+                    X=X,
+                    states=states,
+                    posteriors=posteriors,
+                    labels=labels,
+                    transmat=transmat,
+                    means=detector.model.means_,
+                    covars=detector.model.covars_,
+                    covariance_type=detector.covariance_type,
+                    entropy=entropy,
+                    confidence=confidence,
+                )
+
+            # ── Current Regime Status ──
+            st.markdown("---")
+            st.subheader("Current Regime Forecast")
+
+            fc1, fc2, fc3, fc4 = st.columns(4)
+            dur = pred_summary["duration_forecast"]
+            with fc1:
+                st.metric(
+                    "Current Regime",
+                    pred_summary["current_regime"].upper(),
+                )
+            with fc2:
+                st.metric(
+                    "Run Length",
+                    f"{pred_summary['current_run_length']} bars",
+                )
+            with fc3:
+                st.metric(
+                    "Expected Remaining",
+                    f"{dur['expected_remaining']:.0f} bars",
+                )
+            with fc4:
+                st.metric(
+                    "P(Transition in 5 bars)",
+                    f"{dur['p_transition_5_bars']:.1%}",
+                )
+
+            fc5, fc6, fc7, fc8 = st.columns(4)
+            with fc5:
+                next_label = labels.get(dur["most_likely_next_state"], "unknown")
+                st.metric("Most Likely Next", next_label.upper())
+            with fc6:
+                st.metric("Next Regime Prob", f"{dur['next_state_probability']:.1%}")
+            with fc7:
+                st.metric("Change Points Found", pred_summary["n_changepoints_detected"])
+            with fc8:
+                early_pct = (
+                    pred_summary["n_early_detections"] / max(pred_summary["n_changepoints_detected"], 1)
+                ) * 100
+                st.metric("Early Detections", f"{early_pct:.0f}%",
+                          help="% of change points detected before Viterbi")
+
+            # ── N-Step Regime Forecast ──
+            st.markdown("---")
+            st.subheader("Regime Probability Forecast")
+            st.caption(f"Projected regime probabilities over the next {pred_horizon} bars")
+
+            regime_fc = pred_summary["regime_forecast"]
+            fig_forecast = go.Figure()
+
+            for state_id in range(regime_fc.shape[1]):
+                label_name = labels.get(state_id, f"state_{state_id}")
+                color = get_regime_color(label_name)
+                fig_forecast.add_trace(go.Scatter(
+                    x=list(range(1, pred_horizon + 1)),
+                    y=regime_fc[:, state_id],
+                    mode="lines+markers",
+                    name=label_name,
+                    line=dict(color=color, width=2),
+                    marker=dict(size=4),
+                    fill="tozeroy",
+                    fillcolor=color.replace(")", ", 0.1)").replace("rgb", "rgba")
+                    if color.startswith("rgb") else None,
+                ))
+
+            fig_forecast.update_layout(
+                template="plotly_dark", height=400,
+                xaxis_title="Bars Ahead",
+                yaxis_title="Probability",
+                yaxis=dict(range=[0, 1]),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            )
+            st.plotly_chart(fig_forecast, use_container_width=True)
+
+            # ── Survival Curve ──
+            st.subheader("Regime Survival Curve")
+            st.caption("Probability of remaining in the current regime over time")
+
+            survival = dur["survival_curve"]
+            fig_survival = go.Figure()
+            fig_survival.add_trace(go.Scatter(
+                x=list(range(1, len(survival) + 1)),
+                y=survival,
+                mode="lines",
+                name="Survival Probability",
+                line=dict(color="#00e599", width=2),
+                fill="tozeroy",
+                fillcolor="rgba(0, 229, 153, 0.15)",
+            ))
+            fig_survival.add_hline(y=0.5, line_dash="dot", line_color="#f59e0b",
+                                   annotation_text="Median duration")
+            fig_survival.update_layout(
+                template="plotly_dark", height=300,
+                xaxis_title="Bars Ahead",
+                yaxis_title="P(Still in Regime)",
+                yaxis=dict(range=[0, 1]),
+            )
+            st.plotly_chart(fig_survival, use_container_width=True)
+
+            # ── Change Point Detection Timeline ──
+            st.markdown("---")
+            st.subheader("Change Point Detection")
+
+            bocd = pred_summary["bocd_results"]
+            cp_prob = bocd["changepoint_prob"]
+            early_score = pred_summary["early_detection_score"]
+
+            fig_cp = make_subplots(
+                rows=3, cols=1, shared_xaxes=True,
+                subplot_titles=(
+                    "Price with Regime Overlay",
+                    "BOCD Change Point Probability",
+                    "Composite Early Detection Score",
+                ),
+                row_heights=[0.4, 0.3, 0.3],
+                vertical_spacing=0.06,
+            )
+
+            # Price with regime background
+            dates = df.index
+            fig_cp.add_trace(go.Scatter(
+                x=dates, y=df["Close"],
+                mode="lines", name="Price",
+                line=dict(color="#e2e8f0", width=1),
+            ), row=1, col=1)
+
+            # Shade regime regions on price chart
+            unique_regimes = list(set(labels.values()))
+            for regime_label in unique_regimes:
+                mask = np.array([labels.get(s, "unknown") == regime_label for s in states])
+                if not np.any(mask):
+                    continue
+                color = get_regime_color(regime_label)
+                y_vals = np.where(mask, df["Close"].values, np.nan)
+                fig_cp.add_trace(go.Scatter(
+                    x=dates, y=y_vals,
+                    mode="lines", name=regime_label,
+                    line=dict(color=color, width=2),
+                ), row=1, col=1)
+
+            # Change point probability
+            fig_cp.add_trace(go.Scatter(
+                x=dates, y=cp_prob,
+                mode="lines", name="CP Probability",
+                line=dict(color="#f59e0b", width=1.5),
+                fill="tozeroy", fillcolor="rgba(245, 158, 11, 0.15)",
+            ), row=2, col=1)
+            fig_cp.add_hline(
+                y=pred_threshold, row=2, col=1,
+                line_dash="dot", line_color="#ef4444",
+                annotation_text="Threshold",
+            )
+
+            # Mark detected change points
+            cps = pred_summary["changepoints"]
+            if cps:
+                cp_bars = [cp.bar for cp in cps]
+                cp_probs = [cp.probability for cp in cps]
+                cp_dates = [dates[min(b, len(dates) - 1)] for b in cp_bars]
+                fig_cp.add_trace(go.Scatter(
+                    x=cp_dates, y=cp_probs,
+                    mode="markers", name="Detected CPs",
+                    marker=dict(color="#ef4444", size=8, symbol="triangle-up"),
+                ), row=2, col=1)
+
+            # Composite early detection score
+            fig_cp.add_trace(go.Scatter(
+                x=dates, y=early_score,
+                mode="lines", name="Early Detection",
+                line=dict(color="#06b6d4", width=1.5),
+                fill="tozeroy", fillcolor="rgba(6, 182, 212, 0.15)",
+            ), row=3, col=1)
+
+            fig_cp.update_layout(
+                template="plotly_dark", height=700,
+                showlegend=True,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            )
+            st.plotly_chart(fig_cp, use_container_width=True)
+
+            # ── Change Point Table ──
+            if cps:
+                st.subheader("Detected Change Points")
+                cp_rows = []
+                for cp in cps:
+                    bar_idx = min(cp.bar, len(dates) - 1)
+                    cp_rows.append({
+                        "Date": dates[bar_idx],
+                        "Bar": cp.bar,
+                        "CP Probability": f"{cp.probability:.3f}",
+                        "Run Length Before": cp.run_length_before,
+                        "Regime": cp.actual_regime,
+                        "Detection Lag": cp.detection_lag,
+                        "Early?": "Yes" if cp.detection_lag < 0 else "No",
+                    })
+                st.dataframe(pd.DataFrame(cp_rows), use_container_width=True)
+
+                # Detection lag histogram
+                lags = [cp.detection_lag for cp in cps]
+                fig_lag = go.Figure(go.Histogram(
+                    x=lags, nbinsx=30,
+                    marker_color="#3b82f6",
+                    name="Detection Lag",
+                ))
+                fig_lag.add_vline(x=0, line_dash="dash", line_color="#ef4444",
+                                  annotation_text="Viterbi baseline")
+                fig_lag.update_layout(
+                    template="plotly_dark", height=300,
+                    xaxis_title="Detection Lag (bars, negative = early)",
+                    yaxis_title="Count",
+                    title="BOCD vs Viterbi Detection Lag Distribution",
+                )
+                st.plotly_chart(fig_lag, use_container_width=True)
+
+                st.info(
+                    f"**Summary:** {pred_summary['n_early_detections']} of "
+                    f"{pred_summary['n_changepoints_detected']} change points were "
+                    f"detected earlier by BOCD than Viterbi. "
+                    f"Average lag: {pred_summary['avg_detection_lag']:.1f} bars "
+                    f"(negative = BOCD detected first)."
+                )
 
 else:
     # ── Landing Page ─────────────────────────────────────────────────────

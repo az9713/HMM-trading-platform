@@ -69,6 +69,14 @@ monte_carlo:
   ruin_threshold: 0.5              # equity fraction defining ruin (50% loss)
   seed: 42                         # reproducibility
 
+prediction:
+  hazard_rate: 0.01                   # 1/lambda: prior CP probability per bar
+  forecast_horizon: 20                # bars ahead for regime forecast
+  changepoint_threshold: 0.3          # min CP probability to flag detection
+  max_run_length: 300                 # truncation for run-length posterior
+  blend_weight_bocd: 0.6              # weight for BOCD in composite score
+  blend_weight_entropy: 0.4           # weight for entropy in composite score
+
 backtest:
   train_window_bars: 500
   test_window_bars: 100
