@@ -21,6 +21,7 @@ from fundamentals import FundamentalAnalyzer
 from regime_analyzer import RegimeTransitionAnalyzer
 from multi_timeframe import run_multi_timeframe_analysis, TIMEFRAME_ORDER, DEFAULT_WEIGHTS
 from monte_carlo import MonteCarloEngine
+from regime_predictor import RegimePredictor
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -533,10 +534,10 @@ if run_btn:
 
     # ── Tabs ─────────────────────────────────────────────────────────────
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "Current Signal", "Regime Analysis", "Regime Transitions",
         "Backtest Results", "Trade Log", "Model Diagnostics", "Fundamentals",
-        "Multi-Timeframe", "Monte Carlo",
+        "Multi-Timeframe", "Monte Carlo", "Regime Forecast",
     ])
 
     # ── Tab 1: Current Signal ────────────────────────────────────────────
@@ -1720,6 +1721,218 @@ if run_btn:
                             st.metric("VaR (95%)", f"{sr.var_95:+.2%}")
                         with sc_col3:
                             st.metric("Worst MDD", f"{sr.max_drawdowns.min():.2%}")
+
+    # ── Tab 10: Regime Forecast ─────────────────────────────────────────
+
+    with tab10:
+        st.subheader("Regime Forecast Engine")
+        st.caption(
+            "Forward-looking regime prediction fusing Chapman-Kolmogorov "
+            "transition forecasting, Bayesian Online Changepoint Detection, "
+            "and feature momentum scoring into a unified Regime Stress Index."
+        )
+
+        with st.spinner("Computing regime forecasts..."):
+            rp = RegimePredictor(
+                horizons=(1, 5, 10, 20),
+                bocpd_hazard=1 / 100,
+                momentum_window=10,
+            )
+
+            rp_forecasts = rp.predict(
+                transmat=transmat,
+                posteriors=posteriors,
+                states=states,
+                labels=labels,
+                entropy=entropy,
+                log_returns=df["log_return"].values,
+                volatility=df["rolling_vol"].values,
+                volume_change=df["volume_change"].values,
+            )
+            rp_summary = rp.forecast_summary(rp_forecasts)
+
+        # ── Current Forecast Banner ──
+        latest = rp_forecasts[-1]
+        alert_level, alert_color = rp.stress_alert_level(latest.regime_stress)
+
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, {alert_color}22, {alert_color}08);
+                    border: 1px solid {alert_color}44; border-radius: 12px;
+                    padding: 1.5rem; margin-bottom: 1rem;">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 1rem;">
+                <div>
+                    <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.7rem;
+                                color: #64748b; text-transform: uppercase; letter-spacing: 0.15em;">
+                        Regime Stress Index
+                    </div>
+                    <div style="font-family: 'JetBrains Mono', monospace; font-size: 2.5rem;
+                                font-weight: 700; color: {alert_color};">
+                        {latest.regime_stress:.1%}
+                    </div>
+                    <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.85rem;
+                                color: {alert_color}; font-weight: 600;">
+                        {alert_level}
+                    </div>
+                </div>
+                <div style="text-align: right;">
+                    <div style="font-size: 0.7rem; color: #64748b; font-family: 'JetBrains Mono', monospace;">
+                        Current: <strong style="color: #e2e8f0;">{latest.current_regime.upper()}</strong>
+                    </div>
+                    <div style="font-size: 0.7rem; color: #64748b; font-family: 'JetBrains Mono', monospace; margin-top: 4px;">
+                        Changepoint P: <strong style="color: #e2e8f0;">{latest.changepoint_prob:.1%}</strong>
+                    </div>
+                    <div style="font-size: 0.7rem; color: #64748b; font-family: 'JetBrains Mono', monospace; margin-top: 4px;">
+                        Momentum: <strong style="color: #e2e8f0;">{latest.momentum_score:.1%}</strong>
+                    </div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ── k-Step Transition Probability Cards ──
+        st.markdown("**Probability of Regime Change Within k Bars**")
+        tp_cols = st.columns(4)
+        for i, k in enumerate((1, 5, 10, 20)):
+            with tp_cols[i]:
+                tp = latest.transition_prob.get(k, 0)
+                pred = latest.predicted_regime.get(k, "?")
+                st.metric(
+                    f"{k}-bar horizon",
+                    f"{tp:.1%}",
+                    help=f"P(leaving {latest.current_regime}) within {k} bars",
+                )
+                st.caption(f"Predicted: **{pred}**")
+
+        # ── Regime Stress Time Series ──
+        st.markdown("---")
+        st.subheader("Regime Stress Over Time")
+
+        fig_stress = go.Figure()
+
+        # Color-coded stress line
+        fig_stress.add_trace(go.Scatter(
+            x=list(range(len(rp_summary))),
+            y=rp_summary["regime_stress"],
+            mode="lines",
+            name="Regime Stress",
+            line=dict(color="#f59e0b", width=2),
+        ))
+
+        # Threshold bands
+        fig_stress.add_hline(y=0.75, line_dash="dot", line_color="#ef4444",
+                             annotation_text="CRITICAL", annotation_position="bottom right")
+        fig_stress.add_hline(y=0.55, line_dash="dot", line_color="#f59e0b",
+                             annotation_text="ELEVATED", annotation_position="bottom right")
+        fig_stress.add_hline(y=0.35, line_dash="dot", line_color="#3b82f6",
+                             annotation_text="MODERATE", annotation_position="bottom right")
+
+        fig_stress.update_layout(
+            template="plotly_dark", height=350,
+            xaxis_title="Bar", yaxis_title="Stress Index",
+            yaxis=dict(range=[0, 1]),
+        )
+        st.plotly_chart(fig_stress, use_container_width=True)
+
+        # ── Component Breakdown ──
+        st.subheader("Signal Components")
+        comp_col1, comp_col2 = st.columns(2)
+
+        with comp_col1:
+            fig_cp = go.Figure()
+            fig_cp.add_trace(go.Scatter(
+                x=list(range(len(rp_summary))),
+                y=rp_summary["changepoint_prob"],
+                mode="lines", name="Changepoint Probability",
+                line=dict(color="#ef4444", width=1.5),
+            ))
+            fig_cp.update_layout(
+                template="plotly_dark", height=280,
+                title="Bayesian Changepoint Detection",
+                xaxis_title="Bar", yaxis_title="P(changepoint)",
+                yaxis=dict(range=[0, 1]),
+            )
+            st.plotly_chart(fig_cp, use_container_width=True)
+
+        with comp_col2:
+            fig_mom = go.Figure()
+            fig_mom.add_trace(go.Scatter(
+                x=list(range(len(rp_summary))),
+                y=rp_summary["momentum_score"],
+                mode="lines", name="Feature Momentum",
+                line=dict(color="#3b82f6", width=1.5),
+            ))
+            fig_mom.update_layout(
+                template="plotly_dark", height=280,
+                title="Feature Momentum Score",
+                xaxis_title="Bar", yaxis_title="Momentum (0-1)",
+                yaxis=dict(range=[0, 1]),
+            )
+            st.plotly_chart(fig_mom, use_container_width=True)
+
+        # ── Forward Probability Heatmap ──
+        st.subheader("Regime Probability Forecast (Latest Bar)")
+
+        # Build heatmap data from latest forecast
+        regime_labels_sorted = sorted(latest.forecast_probs[1].keys())
+        heatmap_data = []
+        for k in (1, 5, 10, 20):
+            row = [latest.forecast_probs[k].get(r, 0) for r in regime_labels_sorted]
+            heatmap_data.append(row)
+
+        fig_heat = go.Figure(go.Heatmap(
+            z=heatmap_data,
+            x=regime_labels_sorted,
+            y=[f"{k}-bar" for k in (1, 5, 10, 20)],
+            colorscale="Viridis",
+            text=[[f"{v:.1%}" for v in row] for row in heatmap_data],
+            texttemplate="%{text}",
+            textfont=dict(size=12),
+        ))
+        fig_heat.update_layout(
+            template="plotly_dark", height=250,
+            xaxis_title="Regime", yaxis_title="Horizon",
+        )
+        st.plotly_chart(fig_heat, use_container_width=True)
+
+        # ── Prediction Calibration ──
+        st.subheader("Prediction Calibration (Backtest)")
+        st.caption(
+            "How often did the predicted regime at each horizon match "
+            "the actual realized regime? Higher accuracy at short horizons "
+            "is expected."
+        )
+
+        cal_df = rp.calibration_backtest(rp_forecasts, states, labels)
+        cal_cols = st.columns(4)
+        for i, row in cal_df.iterrows():
+            with cal_cols[i]:
+                acc_color = "#00e599" if row["accuracy"] > 0.7 else "#f59e0b" if row["accuracy"] > 0.5 else "#ef4444"
+                st.metric(
+                    f"{int(row['horizon'])}-bar accuracy",
+                    f"{row['accuracy']:.1%}",
+                    help=f"Based on {int(row['n_predictions'])} predictions",
+                )
+
+        # Calibration bar chart
+        fig_cal = go.Figure(go.Bar(
+            x=[f"{int(r['horizon'])}-bar" for _, r in cal_df.iterrows()],
+            y=[r["accuracy"] * 100 for _, r in cal_df.iterrows()],
+            marker_color=["#00e599" if r["accuracy"] > 0.7
+                          else "#f59e0b" if r["accuracy"] > 0.5
+                          else "#ef4444"
+                          for _, r in cal_df.iterrows()],
+            text=[f"{r['accuracy']:.1%}" for _, r in cal_df.iterrows()],
+            textposition="auto",
+        ))
+        fig_cal.add_hline(y=50, line_dash="dot", line_color="#64748b",
+                          annotation_text="Random baseline")
+        fig_cal.update_layout(
+            template="plotly_dark", height=300,
+            xaxis_title="Forecast Horizon",
+            yaxis_title="Accuracy (%)",
+            yaxis=dict(range=[0, 100]),
+        )
+        st.plotly_chart(fig_cal, use_container_width=True)
 
 else:
     # ── Landing Page ─────────────────────────────────────────────────────
