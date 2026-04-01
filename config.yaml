@@ -69,6 +69,12 @@ monte_carlo:
   ruin_threshold: 0.5              # equity fraction defining ruin (50% loss)
   seed: 42                         # reproducibility
 
+online_filter:
+  cusum_threshold: 3.0              # std devs for CUSUM detection
+  cusum_drift: 0.0                  # allowance (0 = most sensitive)
+  forecast_horizons: [1, 5, 10, 25, 50]
+  entropy_warmup: 20                # bars before CUSUM activates
+
 backtest:
   train_window_bars: 500
   test_window_bars: 100

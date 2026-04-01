@@ -21,6 +21,7 @@ from fundamentals import FundamentalAnalyzer
 from regime_analyzer import RegimeTransitionAnalyzer
 from multi_timeframe import run_multi_timeframe_analysis, TIMEFRAME_ORDER, DEFAULT_WEIGHTS
 from monte_carlo import MonteCarloEngine
+from online_filter import OnlineBayesianFilter
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -533,10 +534,10 @@ if run_btn:
 
     # ── Tabs ─────────────────────────────────────────────────────────────
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "Current Signal", "Regime Analysis", "Regime Transitions",
         "Backtest Results", "Trade Log", "Model Diagnostics", "Fundamentals",
-        "Multi-Timeframe", "Monte Carlo",
+        "Multi-Timeframe", "Monte Carlo", "Live Monitor",
     ])
 
     # ── Tab 1: Current Signal ────────────────────────────────────────────
@@ -1720,6 +1721,280 @@ if run_btn:
                             st.metric("VaR (95%)", f"{sr.var_95:+.2%}")
                         with sc_col3:
                             st.metric("Worst MDD", f"{sr.max_drawdowns.min():.2%}")
+
+    # ── Tab 10: Live Monitor (Online Bayesian Filter) ───────────────────
+
+    with tab10:
+        st.subheader("Live Regime Monitor")
+        st.caption(
+            "Online Bayesian filter: processes each bar through the HMM forward "
+            "algorithm incrementally, giving streaming regime posteriors, "
+            "CUSUM change-point detection, and N-step-ahead regime forecasts."
+        )
+
+        # Config controls
+        lm_col1, lm_col2, lm_col3 = st.columns(3)
+        with lm_col1:
+            lm_cusum = st.slider(
+                "CUSUM Threshold", 1.0, 10.0, 3.0, 0.5,
+                key="lm_cusum",
+                help="Standard deviations for change-point detection (lower = more sensitive)"
+            )
+        with lm_col2:
+            lm_warmup = st.number_input(
+                "Entropy Warmup Bars", 5, 100, 20, step=5,
+                key="lm_warmup",
+                help="Bars before CUSUM activates (need entropy baseline)"
+            )
+        with lm_col3:
+            lm_horizons_str = st.text_input(
+                "Forecast Horizons", "1, 5, 10, 25, 50",
+                key="lm_horizons",
+                help="Comma-separated list of bars to forecast ahead"
+            )
+
+        lm_horizons = [int(h.strip()) for h in lm_horizons_str.split(",") if h.strip().isdigit()]
+        if not lm_horizons:
+            lm_horizons = [1, 5, 10, 25, 50]
+
+        lm_run = st.button("Run Online Filter", type="primary", key="lm_run")
+
+        if lm_run:
+            with st.spinner("Running online Bayesian filter across all bars..."):
+                online_filter = OnlineBayesianFilter(
+                    detector,
+                    cusum_threshold=lm_cusum,
+                    cusum_drift=0.0,
+                    forecast_horizons=lm_horizons,
+                    entropy_warmup=lm_warmup,
+                )
+                ts_index = df.index if hasattr(df.index, 'dtype') else None
+                filter_df = online_filter.process_batch(X, timestamps=ts_index)
+
+                # Align index with original df
+                if len(filter_df) == len(df):
+                    filter_df.index = df.index
+
+            st.success(f"Filtered {online_filter.state.bar_count} bars — "
+                       f"{len(online_filter.change_events)} regime transitions detected")
+
+            # ── Current State Summary ──
+            summary = online_filter.summary()
+            s1, s2, s3, s4 = st.columns(4)
+            with s1:
+                st.metric("Current Regime",
+                          summary["current_label"].upper(),
+                          help="MAP estimate from filtered posterior")
+            with s2:
+                st.metric("Confidence",
+                          f"{summary['confidence']:.1%}",
+                          help="Posterior probability of current regime")
+            with s3:
+                st.metric("Regime Duration",
+                          f"{summary['regime_duration']} bars",
+                          help=f"Expected remaining: ~{summary['expected_remaining_duration']:.0f} bars")
+            with s4:
+                st.metric("Next Likely Regime",
+                          summary["next_likely_regime"].upper(),
+                          delta=f"P={summary['next_regime_prob']:.1%}",
+                          help="Most probable regime if a transition occurs")
+
+            s5, s6, s7, s8 = st.columns(4)
+            with s5:
+                st.metric("Entropy", f"{summary['entropy']:.3f}",
+                          help="Normalized Shannon entropy (0=certain, 1=max uncertainty)")
+            with s6:
+                st.metric("5-Bar Persistence", f"{summary['persistence_prob_5bar']:.1%}",
+                          help="P(same regime for next 5 bars)")
+            with s7:
+                st.metric("Change Events", str(summary["total_change_events"]))
+            with s8:
+                st.metric("Cumul. Log-Lik", f"{summary['cumulative_log_likelihood']:.1f}")
+
+            # ── Streaming Posteriors Chart ──
+            st.markdown("---")
+            st.subheader("Filtered Regime Posteriors")
+            st.caption("Forward algorithm posteriors updated bar-by-bar (no smoothing / no future data)")
+
+            post_cols = [c for c in filter_df.columns if c.startswith("posterior_")]
+            fig_post = go.Figure()
+            for col in post_cols:
+                label = col.replace("posterior_", "")
+                color = get_regime_color(label)
+                fig_post.add_trace(go.Scatter(
+                    x=list(range(len(filter_df))),
+                    y=filter_df[col],
+                    mode="lines", name=label,
+                    line=dict(color=color, width=1.5),
+                    stackgroup="one",
+                ))
+            fig_post.update_layout(
+                template="plotly_dark", height=350,
+                xaxis_title="Bar", yaxis_title="Posterior Probability",
+                yaxis=dict(range=[0, 1]),
+                legend=dict(orientation="h", y=-0.15),
+            )
+            st.plotly_chart(fig_post, use_container_width=True)
+
+            # ── Entropy & CUSUM Chart ──
+            st.subheader("Entropy & Change-Point Detection")
+            fig_entropy = make_subplots(
+                rows=2, cols=1, shared_xaxes=True,
+                subplot_titles=("Shannon Entropy (normalized)", "CUSUM Statistic"),
+                row_heights=[0.5, 0.5], vertical_spacing=0.08,
+            )
+            fig_entropy.add_trace(go.Scatter(
+                x=list(range(len(filter_df))),
+                y=filter_df["entropy"],
+                mode="lines", name="Entropy",
+                line=dict(color="#f59e0b", width=1.5),
+            ), row=1, col=1)
+
+            # Mark CUSUM detections
+            change_bars = filter_df[filter_df["change_detected"] == True].index
+            if len(change_bars) > 0:
+                bar_indices = [list(filter_df.index).index(cb) if cb in filter_df.index
+                               else int(cb) for cb in change_bars]
+                fig_entropy.add_trace(go.Scatter(
+                    x=bar_indices,
+                    y=[filter_df.loc[cb, "entropy"] if cb in filter_df.index
+                       else filter_df.iloc[int(cb)]["entropy"] for cb in change_bars],
+                    mode="markers", name="CUSUM Alert",
+                    marker=dict(color="#ef4444", size=8, symbol="triangle-up"),
+                ), row=1, col=1)
+
+            fig_entropy.add_trace(go.Scatter(
+                x=list(range(len(filter_df))),
+                y=filter_df["cusum_pos"],
+                mode="lines", name="CUSUM+",
+                line=dict(color="#3b82f6", width=1),
+            ), row=2, col=1)
+            fig_entropy.add_trace(go.Scatter(
+                x=list(range(len(filter_df))),
+                y=filter_df["cusum_neg"],
+                mode="lines", name="CUSUM−",
+                line=dict(color="#ef4444", width=1),
+            ), row=2, col=1)
+            fig_entropy.add_hline(
+                y=lm_cusum, line_dash="dot", line_color="#64748b",
+                annotation_text="threshold", row=2, col=1,
+            )
+            fig_entropy.update_layout(template="plotly_dark", height=450)
+            st.plotly_chart(fig_entropy, use_container_width=True)
+
+            # ── Regime Forecast ──
+            st.markdown("---")
+            st.subheader("Regime Probability Forecast")
+            st.caption("N-step-ahead forecasts via transition matrix powers: p(s_{t+h} | data)")
+
+            forecast = online_filter.forecast(horizons=lm_horizons)
+
+            # Forecast table
+            fc_rows = []
+            for h in forecast.forecast_horizons:
+                row = {"Horizon": f"+{h} bars"}
+                for j in range(online_filter.n_states):
+                    label = online_filter.labels.get(j, f"state_{j}")
+                    row[label] = f"{forecast.forecast_probs[h][j]:.1%}"
+                fc_rows.append(row)
+            # Add stationary row
+            stat_row = {"Horizon": "Stationary (∞)"}
+            for j in range(online_filter.n_states):
+                label = online_filter.labels.get(j, f"state_{j}")
+                stat_row[label] = f"{forecast.stationary_dist[j]:.1%}"
+            fc_rows.append(stat_row)
+            st.dataframe(pd.DataFrame(fc_rows), use_container_width=True)
+
+            st.info(f"Forecast converges to stationary distribution in ~{forecast.convergence_horizon} bars")
+
+            # Forecast chart
+            fig_fc = go.Figure()
+            for j in range(online_filter.n_states):
+                label = online_filter.labels.get(j, f"state_{j}")
+                color = get_regime_color(label)
+                y_vals = [forecast.forecast_probs[h][j] for h in forecast.forecast_horizons]
+                fig_fc.add_trace(go.Scatter(
+                    x=[str(h) for h in forecast.forecast_horizons],
+                    y=y_vals,
+                    mode="lines+markers", name=label,
+                    line=dict(color=color, width=2),
+                ))
+                # Stationary reference line
+                fig_fc.add_hline(
+                    y=forecast.stationary_dist[j],
+                    line_dash="dot", line_color=color,
+                    annotation_text=f"π({label})",
+                    annotation_font_size=10,
+                )
+            fig_fc.update_layout(
+                template="plotly_dark", height=350,
+                xaxis_title="Forecast Horizon (bars)",
+                yaxis_title="Regime Probability",
+                yaxis=dict(range=[0, 1]),
+            )
+            st.plotly_chart(fig_fc, use_container_width=True)
+
+            # ── Regime Transition Log ──
+            events = online_filter.change_events
+            if events:
+                st.markdown("---")
+                st.subheader("Regime Transition Log")
+                ev_rows = []
+                for ev in events:
+                    ev_rows.append({
+                        "Bar": ev.bar_index,
+                        "From": ev.from_label.upper(),
+                        "To": ev.to_label.upper(),
+                        "Confidence": f"{ev.confidence:.1%}",
+                        "CUSUM": f"{ev.cusum_value:.2f}",
+                    })
+                st.dataframe(pd.DataFrame(ev_rows), use_container_width=True)
+
+            # ── Predictive Distribution ──
+            st.markdown("---")
+            st.subheader("Predictive Observation Distribution")
+            st.caption("1-step-ahead predictive distribution: Gaussian mixture weighted by forecast")
+
+            pred = online_filter.predictive_distribution(horizon=1)
+            pred_col1, pred_col2 = st.columns(2)
+            with pred_col1:
+                st.markdown("**Mixture Weights**")
+                for j in range(online_filter.n_states):
+                    label = online_filter.labels.get(j, f"state_{j}")
+                    st.markdown(f"- {label}: **{pred['weights'][j]:.1%}**")
+            with pred_col2:
+                st.markdown("**Expected Next-Bar Features**")
+                feat_names = config["data"]["features"]
+                for i, fname in enumerate(feat_names):
+                    st.markdown(f"- {fname}: **{pred['mixture_mean'][i]:.6f}**")
+
+            # ── Persistence Analysis ──
+            st.markdown("---")
+            st.subheader("Regime Persistence Analysis")
+
+            pers_horizons = list(range(1, 51))
+            pers_probs = [online_filter.regime_persistence_prob(h) for h in pers_horizons]
+
+            fig_pers = go.Figure()
+            fig_pers.add_trace(go.Scatter(
+                x=pers_horizons, y=pers_probs,
+                mode="lines", name="P(stay in regime)",
+                line=dict(color="#00e599", width=2),
+                fill="tozeroy", fillcolor="rgba(0, 229, 153, 0.1)",
+            ))
+            fig_pers.add_hline(y=0.5, line_dash="dot", line_color="#64748b",
+                               annotation_text="50%")
+            fig_pers.update_layout(
+                template="plotly_dark", height=300,
+                xaxis_title="Horizon (bars)",
+                yaxis_title="Persistence Probability",
+                yaxis=dict(range=[0, 1]),
+            )
+            st.plotly_chart(fig_pers, use_container_width=True)
+
+            exp_dur = online_filter.expected_regime_duration()
+            st.info(f"Expected total duration of current regime: **~{exp_dur:.1f} bars** "
+                    f"(geometric distribution with p = 1 - a_{{ii}})")
 
 else:
     # ── Landing Page ─────────────────────────────────────────────────────
