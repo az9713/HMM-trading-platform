@@ -63,6 +63,20 @@ multi_timeframe:
     1d: 1.0
     1wk: 1.2
 
+changepoint:
+  hazard_rate: 0.01              # prior P(changepoint) per bar (1/100)
+  threshold: 0.3                 # detection threshold for short run-length mass
+  min_run_length: 10             # minimum bars before detecting changepoints
+  max_run_length: 500            # truncation for run-length distribution
+  feature_index: 0               # which feature to monitor (0 = log_return)
+  store_run_length_dist: true    # store full posterior for visualization
+  stability_weight: 0.3          # weight of BOCPD stability in fused confidence
+  prior:
+    mu0: 0.0                     # prior mean (0 for z-scored data)
+    kappa0: 0.01                 # prior precision on mean (diffuse)
+    alpha0: 0.5                  # prior shape for variance
+    beta0: 0.01                  # prior scale for variance
+
 monte_carlo:
   n_paths: 1000                    # simulated market paths
   n_steps: 252                     # bars per path (252 ≈ 1 trading year daily)

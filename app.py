@@ -21,6 +21,7 @@ from fundamentals import FundamentalAnalyzer
 from regime_analyzer import RegimeTransitionAnalyzer
 from multi_timeframe import run_multi_timeframe_analysis, TIMEFRAME_ORDER, DEFAULT_WEIGHTS
 from monte_carlo import MonteCarloEngine
+from changepoint import BayesianChangepointDetector
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -531,12 +532,26 @@ if run_btn:
     df["entropy"] = entropy
     df["signal"] = signals.values
 
+    # ── Run BOCPD alongside HMM ──
+    with st.spinner("Running Bayesian Changepoint Detection..."):
+        cp_config = {**config, "changepoint": base_config.get("changepoint", {})}
+        cp_detector = BayesianChangepointDetector(cp_config)
+        cp_result = cp_detector.detect(X)
+        cp_result = cp_detector.compare_with_hmm(cp_result, states)
+        bocpd_stability = cp_detector.compute_regime_stability(cp_result.expected_run_length)
+        fused_confidence = cp_detector.fuse_with_hmm_confidence(
+            confidence, cp_result,
+            stability_weight=base_config.get("changepoint", {}).get("stability_weight", 0.3),
+        )
+    df["bocpd_stability"] = bocpd_stability
+    df["fused_confidence"] = fused_confidence
+
     # ── Tabs ─────────────────────────────────────────────────────────────
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "Current Signal", "Regime Analysis", "Regime Transitions",
         "Backtest Results", "Trade Log", "Model Diagnostics", "Fundamentals",
-        "Multi-Timeframe", "Monte Carlo",
+        "Multi-Timeframe", "Monte Carlo", "Changepoint Detection",
     ])
 
     # ── Tab 1: Current Signal ────────────────────────────────────────────
@@ -1720,6 +1735,187 @@ if run_btn:
                             st.metric("VaR (95%)", f"{sr.var_95:+.2%}")
                         with sc_col3:
                             st.metric("Worst MDD", f"{sr.max_drawdowns.min():.2%}")
+
+    # ── Tab 10: Changepoint Detection ───────────────────────────────────
+
+    with tab10:
+        st.subheader("Bayesian Online Changepoint Detection")
+        st.caption(
+            "Real-time regime change detection using Adams & MacKay (2007). "
+            "Runs bar-by-bar alongside the HMM to detect transitions with lower "
+            "latency. When BOCPD fires before the HMM switches, it provides "
+            "predictive early-warning signals."
+        )
+
+        # Key metrics
+        cp_m1, cp_m2, cp_m3, cp_m4 = st.columns(4)
+        n_bocpd = len(cp_result.changepoint_bars)
+        n_hmm_trans = len(cp_result.hmm_transition_bars)
+        n_early = len(cp_result.early_detections)
+        avg_lead = (
+            np.mean(cp_result.detection_lead_bars)
+            if cp_result.detection_lead_bars else 0
+        )
+
+        with cp_m1:
+            st.metric("BOCPD Changepoints", n_bocpd)
+        with cp_m2:
+            st.metric("HMM Transitions", n_hmm_trans)
+        with cp_m3:
+            st.metric("Early Detections", n_early)
+        with cp_m4:
+            st.metric("Avg Lead (bars)", f"{avg_lead:.1f}")
+
+        # ── Price chart with changepoints overlaid ──
+        st.markdown("#### Price with Changepoint & HMM Transition Markers")
+
+        fig_cp = make_subplots(
+            rows=3, cols=1, shared_xaxes=True,
+            row_heights=[0.5, 0.25, 0.25],
+            vertical_spacing=0.04,
+            subplot_titles=["Price + Regime Transitions", "Expected Run Length", "Regime Stability & Fused Confidence"],
+        )
+
+        x_axis = list(range(len(df)))
+
+        # Price line
+        fig_cp.add_trace(go.Scatter(
+            x=x_axis, y=df["Close"].values,
+            mode="lines", name="Price",
+            line=dict(color="#e2e8f0", width=1.5),
+        ), row=1, col=1)
+
+        # BOCPD changepoints as vertical lines
+        for bar in cp_result.changepoint_bars:
+            fig_cp.add_vline(
+                x=bar, line_dash="dash", line_color="#f59e0b",
+                line_width=1, opacity=0.7, row=1, col=1,
+            )
+
+        # HMM transitions as vertical lines
+        for bar in cp_result.hmm_transition_bars:
+            fig_cp.add_vline(
+                x=bar, line_dash="dot", line_color="#3b82f6",
+                line_width=1, opacity=0.5, row=1, col=1,
+            )
+
+        # Expected run length
+        fig_cp.add_trace(go.Scatter(
+            x=x_axis, y=cp_result.expected_run_length,
+            mode="lines", name="E[run length]",
+            line=dict(color="#06b6d4", width=1.5),
+            fill="tozeroy", fillcolor="rgba(6, 182, 212, 0.1)",
+        ), row=2, col=1)
+
+        # Stability and fused confidence
+        fig_cp.add_trace(go.Scatter(
+            x=x_axis, y=bocpd_stability,
+            mode="lines", name="BOCPD Stability",
+            line=dict(color="#00e599", width=1.5),
+        ), row=3, col=1)
+        fig_cp.add_trace(go.Scatter(
+            x=x_axis, y=fused_confidence,
+            mode="lines", name="Fused Confidence",
+            line=dict(color="#f59e0b", width=1.5),
+        ), row=3, col=1)
+        fig_cp.add_trace(go.Scatter(
+            x=x_axis, y=confidence,
+            mode="lines", name="HMM Confidence",
+            line=dict(color="#64748b", width=1, dash="dot"),
+        ), row=3, col=1)
+
+        fig_cp.update_layout(
+            template="plotly_dark", height=700,
+            showlegend=True,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        fig_cp.update_yaxes(title_text="Price", row=1, col=1)
+        fig_cp.update_yaxes(title_text="Run Length", row=2, col=1)
+        fig_cp.update_yaxes(title_text="Score (0-1)", row=3, col=1)
+
+        st.plotly_chart(fig_cp, use_container_width=True)
+
+        st.markdown(
+            "*Amber dashed lines* = BOCPD changepoints | "
+            "*Blue dotted lines* = HMM regime transitions"
+        )
+
+        # ── Early detection table ──
+        if cp_result.early_detections:
+            st.markdown("#### Early Detection Events (BOCPD fired before HMM)")
+            early_df = pd.DataFrame(cp_result.early_detections)
+            early_df.columns = ["BOCPD Bar", "HMM Bar", "Lead (bars)", "CP Probability"]
+            early_df["Lead (bars)"] = early_df["Lead (bars)"].astype(int)
+            early_df["CP Probability"] = early_df["CP Probability"].apply(lambda x: f"{x:.4f}")
+            st.dataframe(early_df, use_container_width=True)
+        else:
+            st.info("No early detections found in this run. "
+                    "BOCPD and HMM transitioned at similar times.")
+
+        # ── Run-length heatmap ──
+        if cp_result.run_length_posterior is not None:
+            st.markdown("#### Run-Length Posterior Heatmap")
+            st.caption(
+                "Shows P(run_length | data) over time. Bright regions indicate "
+                "confident run-length estimates. Resets to short run lengths "
+                "indicate detected changepoints."
+            )
+
+            rl_post = cp_result.run_length_posterior
+            # Truncate display to max 100 run lengths for readability
+            max_display_rl = min(100, rl_post.shape[1])
+            rl_display = rl_post[:, :max_display_rl].T
+
+            fig_rl = go.Figure(data=go.Heatmap(
+                z=rl_display,
+                x=x_axis,
+                y=list(range(max_display_rl)),
+                colorscale=[
+                    [0, "#0a0e17"],
+                    [0.2, "#1e293b"],
+                    [0.5, "#06b6d4"],
+                    [0.8, "#00e599"],
+                    [1.0, "#f59e0b"],
+                ],
+                colorbar=dict(title="P(r)"),
+                zmin=0,
+                zmax=min(0.3, float(rl_display.max())),
+            ))
+            fig_rl.update_layout(
+                template="plotly_dark", height=350,
+                xaxis_title="Bar",
+                yaxis_title="Run Length",
+                yaxis=dict(autorange=True),
+            )
+            st.plotly_chart(fig_rl, use_container_width=True)
+
+        # ── Dual-detector comparison summary ──
+        st.markdown("#### Dual-Detection Architecture Summary")
+
+        summary_col1, summary_col2 = st.columns(2)
+        with summary_col1:
+            st.markdown("""
+            **HMM (Batch Decoder)**
+            - Identifies *which* regime (bull, bear, crash, etc.)
+            - Uses full observation history via Viterbi decoding
+            - Provides posterior probabilities and entropy-based confidence
+            - Strength: regime *identification*
+            """)
+        with summary_col2:
+            st.markdown("""
+            **BOCPD (Online Detector)**
+            - Detects *when* transitions happen, bar-by-bar
+            - Maintains run-length distribution without batch refitting
+            - Provides regime stability and early-warning signals
+            - Strength: transition *timing*
+            """)
+
+        st.markdown(
+            "**Fused confidence** combines both detectors: when HMM is confident "
+            "and BOCPD shows a stable run length, confidence amplifies. When BOCPD "
+            "detects instability (short run length / changepoint), confidence "
+            "reduces even if HMM posteriors look strong — providing early de-risking."
+        )
 
 else:
     # ── Landing Page ─────────────────────────────────────────────────────
