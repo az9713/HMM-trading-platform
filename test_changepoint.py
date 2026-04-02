@@ -1,261 +1,286 @@
-"""Tests for changepoint.py — Bayesian Online Changepoint Detection."""
+"""
+Tests for changepoint.py — Bayesian Online Changepoint Detection.
+"""
 
 import numpy as np
-import pandas as pd
 import pytest
-
 from changepoint import (
-    BOCDEngine,
-    BOCDResult,
-    StudentTPredictor,
-    MultivariatePredictor,
+    StudentTPredictive,
+    BayesianChangepointDetector,
+    ChangepointResult,
 )
 
 
 @pytest.fixture
-def default_config():
+def simple_config():
     return {
         "changepoint": {
-            "hazard_lambda": 100,
+            "hazard_rate": 1.0 / 50,
             "threshold": 0.3,
-            "prior_mu": 0.0,
-            "prior_kappa": 1.0,
-            "prior_alpha": 1.0,
-            "prior_beta": 1.0,
             "min_run_length": 5,
-        }
+            "max_run_length": 200,
+            "feature_index": 0,
+            "store_run_length_dist": True,
+            "prior": {
+                "mu0": 0.0,
+                "kappa0": 0.01,
+                "alpha0": 0.5,
+                "beta0": 0.01,
+            },
+        },
     }
 
 
 @pytest.fixture
-def regime_switch_series():
-    """Generate a time series with a clear regime switch at bar 100."""
+def regime_switch_data():
+    """Synthetic data with a clear regime change at bar 100."""
     rng = np.random.default_rng(42)
     n = 200
-    # Regime 1: N(0, 0.01) for bars 0-99
-    segment1 = rng.normal(0.0, 0.01, 100)
-    # Regime 2: N(0.05, 0.03) for bars 100-199 — big mean/vol shift
-    segment2 = rng.normal(0.05, 0.03, 100)
-    return np.concatenate([segment1, segment2])
+    x = np.empty(n)
+    # Regime 1: mean=0.01, low vol
+    x[:100] = rng.normal(0.01, 0.005, 100)
+    # Regime 2: mean=-0.02, high vol
+    x[100:] = rng.normal(-0.02, 0.02, 100)
+    return x
 
 
 @pytest.fixture
-def multi_regime_series():
-    """Generate a series with 3 distinct regimes."""
+def multi_regime_data():
+    """Synthetic data with three regimes."""
     rng = np.random.default_rng(123)
-    seg1 = rng.normal(0.0, 0.01, 80)    # calm
-    seg2 = rng.normal(-0.03, 0.05, 60)  # crash
-    seg3 = rng.normal(0.02, 0.015, 80)  # recovery
-    return np.concatenate([seg1, seg2, seg3])
+    n = 300
+    x = np.empty(n)
+    x[:100] = rng.normal(0.01, 0.005, 100)   # bull
+    x[100:200] = rng.normal(-0.02, 0.02, 100)  # crash
+    x[200:] = rng.normal(0.005, 0.008, 100)  # recovery
+    return x
 
 
-# ── StudentTPredictor tests ─────────────────────────────────────────────────
+@pytest.fixture
+def two_dim_data():
+    """2-D feature matrix with changepoint in first column."""
+    rng = np.random.default_rng(42)
+    n = 200
+    X = np.empty((n, 5))
+    X[:100, 0] = rng.normal(0.01, 0.005, 100)
+    X[100:, 0] = rng.normal(-0.02, 0.02, 100)
+    for col in range(1, 5):
+        X[:, col] = rng.normal(0, 0.01, n)
+    return X
 
 
-class TestStudentTPredictor:
-    def test_predictive_logprob_returns_finite(self):
-        pred = StudentTPredictor()
-        mu = np.array([0.0, 0.0])
-        kappa = np.array([1.0, 2.0])
-        alpha = np.array([1.0, 1.5])
-        beta = np.array([1.0, 1.0])
-        logp = pred.predictive_logprob(0.01, mu, kappa, alpha, beta)
-        assert logp.shape == (2,)
-        assert np.all(np.isfinite(logp))
-        assert np.all(logp <= 0)  # log probabilities are non-positive
+class TestStudentTPredictive:
+    def test_log_predictive_shape(self):
+        pred = StudentTPredictive()
+        mu = np.array([0.0, 0.01, -0.01])
+        kappa = np.array([0.01, 1.01, 2.01])
+        alpha = np.array([0.5, 1.0, 1.5])
+        beta = np.array([0.01, 0.02, 0.03])
+        log_p = pred.log_predictive(0.005, mu, kappa, alpha, beta)
+        assert log_p.shape == (3,)
 
-    def test_logprob_higher_at_mean(self):
-        pred = StudentTPredictor(mu0=0.0)
+    def test_log_predictive_finite(self):
+        pred = StudentTPredictive()
         mu = np.array([0.0])
-        kappa = np.array([10.0])
-        alpha = np.array([5.0])
-        beta = np.array([1.0])
-        logp_at_mean = pred.predictive_logprob(0.0, mu, kappa, alpha, beta)
-        logp_far = pred.predictive_logprob(5.0, mu, kappa, alpha, beta)
-        assert logp_at_mean[0] > logp_far[0]
+        kappa = np.array([0.01])
+        alpha = np.array([0.5])
+        beta = np.array([0.01])
+        log_p = pred.log_predictive(0.0, mu, kappa, alpha, beta)
+        assert np.all(np.isfinite(log_p))
 
-    def test_update_sufficient_stats(self):
-        pred = StudentTPredictor()
+    def test_predictive_peaks_near_mean(self):
+        """Predictive should be highest near the running mean."""
+        pred = StudentTPredictive()
+        mu = np.array([0.05])
+        kappa = np.array([100.0])  # high certainty
+        alpha = np.array([50.0])
+        beta = np.array([0.01])
+        lp_at_mean = pred.log_predictive(0.05, mu, kappa, alpha, beta)
+        lp_far = pred.log_predictive(0.5, mu, kappa, alpha, beta)
+        assert lp_at_mean[0] > lp_far[0]
+
+    def test_update_suffstats_shape(self):
+        pred = StudentTPredictive()
+        mu = np.array([0.0, 0.01])
+        kappa = np.array([0.01, 1.0])
+        alpha = np.array([0.5, 1.0])
+        beta = np.array([0.01, 0.02])
+        mu2, k2, a2, b2 = pred.update_suffstats(0.005, mu, kappa, alpha, beta)
+        assert mu2.shape == (2,)
+        assert k2.shape == (2,)
+        assert a2.shape == (2,)
+        assert b2.shape == (2,)
+
+    def test_update_increases_kappa_alpha(self):
+        """kappa and alpha should increase after each observation."""
+        pred = StudentTPredictive()
         mu = np.array([0.0])
-        kappa = np.array([1.0])
-        alpha = np.array([1.0])
-        beta = np.array([1.0])
-        new_mu, new_kappa, new_alpha, new_beta = pred.update_sufficient_stats(
-            0.5, mu, kappa, alpha, beta
-        )
-        assert new_kappa[0] == 2.0
-        assert new_alpha[0] == 1.5
-        assert np.isclose(new_mu[0], 0.25)  # (1*0 + 0.5) / 2
-        assert new_beta[0] > beta[0]  # beta always grows
+        kappa = np.array([0.01])
+        alpha = np.array([0.5])
+        beta = np.array([0.01])
+        _, k2, a2, _ = pred.update_suffstats(0.005, mu, kappa, alpha, beta)
+        assert k2[0] > kappa[0]
+        assert a2[0] > alpha[0]
 
 
-# ── MultivariatePredictor tests ─────────────────────────────────────────────
+class TestBOCPDDetection:
+    def test_output_shape(self, simple_config, regime_switch_data):
+        detector = BayesianChangepointDetector(simple_config)
+        result = detector.detect(regime_switch_data)
+        T = len(regime_switch_data)
+        assert result.changepoint_prob.shape == (T,)
+        assert result.map_run_length.shape == (T,)
+        assert result.expected_run_length.shape == (T,)
+        assert result.detected_changepoints.shape == (T,)
 
-
-class TestMultivariatePredictor:
-    def test_predictive_logprob_multivariate(self):
-        pred = MultivariatePredictor(n_features=3)
-        stats = [
-            (np.array([0.0]), np.array([1.0]), np.array([1.0]), np.array([1.0]))
-            for _ in range(3)
-        ]
-        x = np.array([0.01, -0.02, 0.005])
-        logp = pred.predictive_logprob(x, stats)
-        assert logp.shape == (1,)
-        assert np.isfinite(logp[0])
-
-    def test_update_stats_multivariate(self):
-        pred = MultivariatePredictor(n_features=2)
-        stats = [
-            (np.array([0.0]), np.array([1.0]), np.array([1.0]), np.array([1.0]))
-            for _ in range(2)
-        ]
-        x = np.array([0.5, -0.3])
-        new_stats = pred.update_sufficient_stats(x, stats)
-        assert len(new_stats) == 2
-        for dim_stats in new_stats:
-            assert len(dim_stats) == 4
-            assert dim_stats[1][0] == 2.0  # kappa updated
-
-
-# ── BOCDEngine tests ────────────────────────────────────────────────────────
-
-
-class TestBOCDEngine:
-    def test_detect_returns_correct_shape(self, default_config):
-        engine = BOCDEngine(default_config)
-        X = np.random.default_rng(0).normal(0, 1, 50)
-        result = engine.detect(X)
-
-        assert isinstance(result, BOCDResult)
-        assert result.changepoint_prob.shape == (50,)
-        assert result.map_run_length.shape == (50,)
-        assert result.growth_prob.shape == (50,)
+    def test_cp_prob_valid_range(self, simple_config, regime_switch_data):
+        detector = BayesianChangepointDetector(simple_config)
+        result = detector.detect(regime_switch_data)
         assert np.all(result.changepoint_prob >= 0)
         assert np.all(result.changepoint_prob <= 1)
 
-    def test_detect_finds_obvious_changepoint(self, default_config, regime_switch_series):
-        engine = BOCDEngine(default_config)
-        result = engine.detect(regime_switch_series)
+    def test_detects_regime_switch(self, simple_config, regime_switch_data):
+        """Should detect the changepoint near bar 100."""
+        detector = BayesianChangepointDetector(simple_config)
+        result = detector.detect(regime_switch_data)
+        # At least one detection within 15 bars of the true changepoint
+        cp_bars = result.changepoint_bars
+        near_100 = [b for b in cp_bars if 90 <= b <= 115]
+        assert len(near_100) > 0, f"No changepoint detected near bar 100. Detected at: {cp_bars}"
 
-        # Should detect a changepoint near bar 100
-        if len(result.changepoints) > 0:
-            closest = result.changepoints[
-                np.argmin(np.abs(result.changepoints - 100))
-            ]
-            assert abs(closest - 100) < 20, (
-                f"Expected changepoint near bar 100, closest was {closest}"
-            )
+    def test_detects_multiple_changes(self, simple_config, multi_regime_data):
+        """Should detect both changepoints in 3-regime data."""
+        detector = BayesianChangepointDetector(simple_config)
+        result = detector.detect(multi_regime_data)
+        cp_bars = result.changepoint_bars
+        near_100 = [b for b in cp_bars if 90 <= b <= 115]
+        near_200 = [b for b in cp_bars if 190 <= b <= 215]
+        assert len(near_100) > 0, f"Missed first changepoint. Detected at: {cp_bars}"
+        assert len(near_200) > 0, f"Missed second changepoint. Detected at: {cp_bars}"
 
-        # Changepoint probability should spike around bar 100
-        window = result.changepoint_prob[90:120]
-        assert np.max(window) > 0.1, "Expected elevated cp probability near regime switch"
+    def test_2d_input(self, simple_config, two_dim_data):
+        """Should work with 2-D feature matrix."""
+        detector = BayesianChangepointDetector(simple_config)
+        result = detector.detect(two_dim_data)
+        assert result.changepoint_prob.shape == (200,)
+        # Should still detect the changepoint in column 0
+        cp_bars = result.changepoint_bars
+        near_100 = [b for b in cp_bars if 90 <= b <= 115]
+        assert len(near_100) > 0
 
-    def test_detect_multivariate(self, default_config):
-        rng = np.random.default_rng(42)
-        X = np.column_stack([
-            rng.normal(0, 0.01, 100),
-            rng.normal(0, 0.5, 100),
-        ])
-        engine = BOCDEngine(default_config)
-        result = engine.detect(X)
-        assert result.changepoint_prob.shape == (100,)
-
-    def test_detect_multi_regime(self, default_config, multi_regime_series):
-        engine = BOCDEngine(default_config)
-        result = engine.detect(multi_regime_series)
-
-        # Should detect changepoints near bars 80 and 140
-        assert len(result.changepoints) >= 1, "Should detect at least one changepoint"
-
-    def test_constant_series_no_changepoints(self, default_config):
-        """A perfectly constant series should have low changepoint probability."""
-        engine = BOCDEngine(default_config)
-        X = np.ones(100) * 0.01
-        result = engine.detect(X)
-        # After initial transient, cp probability should be very low
-        assert np.mean(result.changepoint_prob[20:]) < 0.1
-
-    def test_hazard_function(self, default_config):
-        engine = BOCDEngine(default_config)
-        r = np.array([0, 10, 50, 100])
-        h = engine.hazard(r)
-        assert np.allclose(h, 1.0 / 100)
-
-    def test_store_posterior(self, default_config):
-        default_config["changepoint"]["store_posterior"] = True
-        engine = BOCDEngine(default_config)
-        X = np.random.default_rng(0).normal(0, 1, 30)
-        result = engine.detect(X)
+    def test_run_length_posterior_stored(self, simple_config, regime_switch_data):
+        detector = BayesianChangepointDetector(simple_config)
+        result = detector.detect(regime_switch_data)
         assert result.run_length_posterior is not None
-        assert len(result.run_length_posterior) == 30
-        # Each entry should be a valid probability distribution
-        for rl_dist in result.run_length_posterior:
-            assert np.isclose(rl_dist.sum(), 1.0, atol=1e-6)
+        assert result.run_length_posterior.shape[0] == len(regime_switch_data)
 
-    def test_detect_on_features(self, default_config):
-        rng = np.random.default_rng(42)
-        df = pd.DataFrame({
-            "log_return": rng.normal(0, 0.01, 100),
-            "rolling_vol": rng.exponential(0.01, 100),
-        })
-        engine = BOCDEngine(default_config)
-        result = engine.detect_on_features(df, feature_cols=["log_return"])
-        assert result.changepoint_prob.shape == (100,)
+    def test_no_false_positives_in_stable_data(self, simple_config):
+        """Stable data should produce few or no changepoints."""
+        rng = np.random.default_rng(99)
+        stable = rng.normal(0.001, 0.005, 200)
+        detector = BayesianChangepointDetector(simple_config)
+        result = detector.detect(stable)
+        # Allow some false positives but not many
+        assert len(result.changepoint_bars) < 10
 
-    def test_detect_on_features_missing_col(self, default_config):
-        df = pd.DataFrame({"close": np.ones(10)})
-        engine = BOCDEngine(default_config)
-        with pytest.raises(ValueError, match="Missing feature columns"):
-            engine.detect_on_features(df, feature_cols=["log_return"])
+    def test_expected_run_length_grows(self, simple_config):
+        """In stable data, expected run length should generally increase."""
+        rng = np.random.default_rng(99)
+        stable = rng.normal(0.001, 0.005, 100)
+        detector = BayesianChangepointDetector(simple_config)
+        result = detector.detect(stable)
+        # Expected run length at the end should be > at the start (after warmup)
+        assert result.expected_run_length[-1] > result.expected_run_length[10]
 
-    def test_changepoint_confirmation(self, default_config, regime_switch_series):
-        engine = BOCDEngine(default_config)
-        result = engine.detect(regime_switch_series)
-        confirmed = engine.changepoint_confirmation(result, window=10)
-        assert confirmed.shape == (200,)
-        assert np.all(confirmed >= 0)
-        assert np.all(confirmed <= 1)
-        # Confirmed should be >= raw cp prob (it's a rolling max)
-        assert np.all(confirmed >= result.changepoint_prob - 1e-10)
+    def test_deterministic(self, simple_config, regime_switch_data):
+        """Same input should produce same output (algorithm is deterministic)."""
+        detector = BayesianChangepointDetector(simple_config)
+        r1 = detector.detect(regime_switch_data)
+        r2 = detector.detect(regime_switch_data)
+        np.testing.assert_array_equal(r1.changepoint_prob, r2.changepoint_prob)
+        np.testing.assert_array_equal(r1.changepoint_bars, r2.changepoint_bars)
 
-    def test_regime_stability_score(self, default_config, regime_switch_series):
-        engine = BOCDEngine(default_config)
-        result = engine.detect(regime_switch_series)
-        stability = engine.regime_stability_score(result)
-        assert stability.shape == (200,)
-        assert np.all(stability >= 0)
-        assert np.all(stability <= 1)
 
-    def test_min_run_length_filtering(self):
-        config = {
-            "changepoint": {
-                "hazard_lambda": 50,
-                "threshold": 0.01,  # very low threshold to trigger many
-                "min_run_length": 20,
-            }
-        }
-        engine = BOCDEngine(config)
-        rng = np.random.default_rng(42)
-        X = rng.normal(0, 1, 200)
-        result = engine.detect(X)
-        # Check that detected changepoints are at least min_run_length apart
-        if len(result.changepoints) > 1:
-            gaps = np.diff(result.changepoints)
-            assert np.all(gaps >= 20), f"Gaps too small: {gaps}"
+class TestHMMComparison:
+    def test_compare_finds_early_detections(self, simple_config, regime_switch_data):
+        """BOCPD should detect the change before or at the same time as HMM."""
+        detector = BayesianChangepointDetector(simple_config)
+        result = detector.detect(regime_switch_data)
 
-    def test_probabilities_sum_correctly(self, default_config):
-        """Changepoint prob + growth prob should be close to 1."""
-        engine = BOCDEngine(default_config)
-        X = np.random.default_rng(0).normal(0, 0.01, 50)
-        result = engine.detect(X)
-        total = result.changepoint_prob + result.growth_prob
-        assert np.allclose(total, 1.0, atol=0.05)
+        # Simulate HMM states: switches at exactly bar 100
+        hmm_states = np.zeros(200, dtype=int)
+        hmm_states[100:] = 1
 
-    def test_empty_config_uses_defaults(self):
-        engine = BOCDEngine({})
-        assert engine.hazard_lambda == 200
-        assert engine.threshold == 0.5
-        X = np.random.default_rng(0).normal(0, 1, 30)
-        result = engine.detect(X)
-        assert result.changepoint_prob.shape == (30,)
+        result = detector.compare_with_hmm(result, hmm_states, max_lead=20)
+        assert len(result.hmm_transition_bars) == 1
+        assert result.hmm_transition_bars[0] == 100
+
+    def test_early_detection_lead_positive(self, simple_config, regime_switch_data):
+        """Early detections should have positive lead (BOCPD fires first)."""
+        detector = BayesianChangepointDetector(simple_config)
+        result = detector.detect(regime_switch_data)
+
+        hmm_states = np.zeros(200, dtype=int)
+        hmm_states[105:] = 1  # HMM transitions 5 bars AFTER true change
+
+        result = detector.compare_with_hmm(result, hmm_states, max_lead=20)
+        for ed in result.early_detections:
+            assert ed["lead_bars"] > 0
+
+    def test_no_hmm_transitions(self, simple_config, regime_switch_data):
+        """When HMM never transitions, no early detections."""
+        detector = BayesianChangepointDetector(simple_config)
+        result = detector.detect(regime_switch_data)
+
+        hmm_states = np.zeros(200, dtype=int)  # never changes
+        result = detector.compare_with_hmm(result, hmm_states)
+        assert len(result.early_detections) == 0
+
+
+class TestRegimeStability:
+    def test_stability_bounded(self, simple_config, regime_switch_data):
+        detector = BayesianChangepointDetector(simple_config)
+        result = detector.detect(regime_switch_data)
+        stability = detector.compute_regime_stability(result.expected_run_length)
+        assert np.all(stability >= 0.0)
+        assert np.all(stability <= 1.0)
+
+    def test_stability_drops_at_changepoint(self, simple_config, regime_switch_data):
+        """Stability should drop around the changepoint."""
+        detector = BayesianChangepointDetector(simple_config)
+        result = detector.detect(regime_switch_data)
+        stability = detector.compute_regime_stability(result.expected_run_length)
+        # Stability before the change should be higher than right after
+        avg_before = stability[80:95].mean()
+        avg_after = stability[100:110].mean()
+        assert avg_before > avg_after
+
+
+class TestConfidenceFusion:
+    def test_fused_confidence_bounded(self, simple_config, regime_switch_data):
+        detector = BayesianChangepointDetector(simple_config)
+        result = detector.detect(regime_switch_data)
+        hmm_conf = np.random.default_rng(42).uniform(0.5, 1.0, 200)
+        fused = detector.fuse_with_hmm_confidence(hmm_conf, result)
+        assert np.all(fused >= 0.0)
+        assert np.all(fused <= 1.0)
+
+    def test_fused_reduces_at_changepoint(self, simple_config, regime_switch_data):
+        """Fused confidence should be lower at changepoints than HMM alone."""
+        detector = BayesianChangepointDetector(simple_config)
+        result = detector.detect(regime_switch_data)
+        # HMM confidence stays high (doesn't see the change yet)
+        hmm_conf = np.full(200, 0.9)
+        fused = detector.fuse_with_hmm_confidence(hmm_conf, result, stability_weight=0.5)
+        # At the changepoint region, fused should be noticeably lower
+        if len(result.changepoint_bars) > 0:
+            cp_bar = result.changepoint_bars[0]
+            assert fused[cp_bar] < hmm_conf[cp_bar]
+
+    def test_stability_weight_zero_returns_hmm(self, simple_config, regime_switch_data):
+        """With zero stability weight, fused should equal HMM confidence."""
+        detector = BayesianChangepointDetector(simple_config)
+        result = detector.detect(regime_switch_data)
+        hmm_conf = np.random.default_rng(42).uniform(0.5, 1.0, 200)
+        fused = detector.fuse_with_hmm_confidence(hmm_conf, result, stability_weight=0.0)
+        np.testing.assert_allclose(fused, hmm_conf, atol=1e-10)
