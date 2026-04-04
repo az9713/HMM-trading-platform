@@ -69,6 +69,16 @@ monte_carlo:
   ruin_threshold: 0.5              # equity fraction defining ruin (50% loss)
   seed: 42                         # reproducibility
 
+predictor:
+  max_horizon: 20               # max bars to forecast ahead
+  macro_weight: 0.3             # 0-1, influence of macro on asset forecast
+  macro_n_states: 3             # macro HMM states (risk_on, neutral, risk_off)
+  macro_n_restarts: 10          # random restarts for macro HMM
+  macro_lookback_days: 365      # how far back to fetch macro data
+  stress_thresholds:
+    low: -0.5                   # below = low stress (risk-on)
+    high: 0.5                   # above = high stress (risk-off)
+
 backtest:
   train_window_bars: 500
   test_window_bars: 100

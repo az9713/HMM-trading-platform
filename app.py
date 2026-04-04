@@ -21,6 +21,7 @@ from fundamentals import FundamentalAnalyzer
 from regime_analyzer import RegimeTransitionAnalyzer
 from multi_timeframe import run_multi_timeframe_analysis, TIMEFRAME_ORDER, DEFAULT_WEIGHTS
 from monte_carlo import MonteCarloEngine
+from regime_predictor import RegimePredictor, MacroFeatureCollector, count_bars_in_current_regime
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -533,10 +534,10 @@ if run_btn:
 
     # ── Tabs ─────────────────────────────────────────────────────────────
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "Current Signal", "Regime Analysis", "Regime Transitions",
         "Backtest Results", "Trade Log", "Model Diagnostics", "Fundamentals",
-        "Multi-Timeframe", "Monte Carlo",
+        "Multi-Timeframe", "Monte Carlo", "Regime Forecast",
     ])
 
     # ── Tab 1: Current Signal ────────────────────────────────────────────
@@ -1720,6 +1721,292 @@ if run_btn:
                             st.metric("VaR (95%)", f"{sr.var_95:+.2%}")
                         with sc_col3:
                             st.metric("Worst MDD", f"{sr.max_drawdowns.min():.2%}")
+
+    # ── Tab 10: Regime Forecast ─────────────────────────────────────────
+
+    with tab10:
+        st.subheader("Predictive Regime Forecast")
+        st.caption(
+            "N-step-ahead regime probability forecasts using Chapman-Kolmogorov "
+            "on the fitted transition matrix, optionally enhanced with cross-asset "
+            "macro leading indicators (VIX, yields, credit, USD, gold)."
+        )
+
+        # Controls
+        fc_col1, fc_col2, fc_col3 = st.columns(3)
+        with fc_col1:
+            fc_max_horizon = st.slider(
+                "Max forecast horizon (bars)", 5, 50, 20, 5, key="fc_horizon"
+            )
+        with fc_col2:
+            fc_macro_weight = st.slider(
+                "Macro fusion weight", 0.0, 1.0, 0.3, 0.05, key="fc_macro_w",
+                help="How much cross-asset macro signals influence the forecast (0 = none)"
+            )
+        with fc_col3:
+            fc_enable_macro = st.checkbox(
+                "Enable cross-asset macro fusion", value=False, key="fc_macro_on",
+                help="Fetches VIX, treasury yields, credit spreads, USD, gold"
+            )
+
+        fc_run = st.button("Generate Forecast", type="primary", key="fc_run")
+
+        if fc_run:
+            pred_config = config.copy()
+            pred_config["predictor"] = {
+                "max_horizon": fc_max_horizon,
+                "macro_weight": fc_macro_weight,
+                "macro_n_states": 3,
+                "macro_n_restarts": 10,
+            }
+            predictor = RegimePredictor(pred_config)
+            bars_in = count_bars_in_current_regime(states)
+            current_state = int(states[-1])
+            current_post = posteriors[-1]
+
+            # Optional macro fusion
+            macro_post = None
+            macro_labels_map = None
+            macro_stress = None
+            macro_features_df = None
+
+            if fc_enable_macro:
+                with st.spinner("Fetching cross-asset macro data..."):
+                    try:
+                        collector = MacroFeatureCollector()
+                        macro_features_df = collector.fetch(interval="1d", lookback_days=365)
+                        macro_stress = collector.compute_macro_stress_index(macro_features_df)
+
+                        macro_model, macro_states, macro_posteriors = predictor.fit_macro_hmm(
+                            macro_features_df
+                        )
+                        macro_labels_map = predictor.label_macro_regimes(
+                            macro_model, macro_features_df
+                        )
+                        macro_post = macro_posteriors[-1]
+                    except Exception as e:
+                        st.warning(f"Macro data unavailable: {e}. Proceeding without macro fusion.")
+                        macro_post = None
+
+            with st.spinner("Computing regime forecasts..."):
+                summary = predictor.generate_forecast_summary(
+                    transmat=transmat,
+                    current_posteriors=current_post,
+                    current_state=current_state,
+                    labels=labels,
+                    bars_in_regime=bars_in,
+                    macro_posteriors=macro_post,
+                    macro_labels=macro_labels_map,
+                )
+
+            # ── Current Regime Status ──
+            st.markdown("---")
+            cur = summary["current"]
+            dur = summary["duration"]
+
+            s1, s2, s3, s4 = st.columns(4)
+            with s1:
+                st.metric("Current Regime", cur["label"].upper(),
+                          help="Viterbi-decoded regime at the latest bar")
+            with s2:
+                st.metric("Confidence", f"{cur['confidence']:.1%}",
+                          help="Posterior probability of current regime")
+            with s3:
+                st.metric("Bars in Regime", f"{cur['bars_in_regime']}")
+            with s4:
+                st.metric("Expected Remaining", f"{dur['expected_remaining']:.0f} bars",
+                          help="Geometric mean remaining duration (memoryless)")
+
+            d1, d2, d3, d4 = st.columns(4)
+            with d1:
+                st.metric("Exit Prob/Bar", f"{dur['exit_prob_per_bar']:.1%}",
+                          help="Probability of leaving current regime each bar")
+            with d2:
+                st.metric("Median Remaining", f"{dur['median_remaining']:.0f} bars")
+            with d3:
+                st.metric("90th Pct Duration", f"{dur['p90_remaining']:.0f} bars",
+                          help="90% of regime durations end before this")
+            with d4:
+                macro_tag = "ON" if summary["macro_adjusted"] else "OFF"
+                st.metric("Macro Fusion", macro_tag)
+
+            # ── Regime Probability Fan Chart ──
+            st.markdown("---")
+            st.subheader("N-Step Ahead Regime Probabilities")
+
+            horizons = [f["horizon"] for f in summary["forecasts"]]
+            regime_names = sorted(labels.values(), key=lambda x: (
+                {"crash": 0, "bear": 1, "neutral": 2, "bull": 3, "bull_run": 4}.get(x, 2)
+            ))
+
+            # Build data for stacked area chart
+            fig_fc = go.Figure()
+            regime_plot_colors = {
+                "crash": "#d32f2f", "bear": "#f57c00", "neutral": "#9e9e9e",
+                "bull": "#388e3c", "bull_run": "#1565c0",
+            }
+
+            for regime in regime_names:
+                probs = []
+                for fc in summary["forecasts"]:
+                    probs.append(fc["probs"].get(regime, 0.0))
+
+                color = regime_plot_colors.get(regime, "#888888")
+                fig_fc.add_trace(go.Scatter(
+                    x=horizons, y=[p * 100 for p in probs],
+                    mode="lines+markers",
+                    name=regime,
+                    line=dict(color=color, width=2.5),
+                    marker=dict(size=8),
+                    stackgroup=None,
+                ))
+
+            fig_fc.update_layout(
+                template="plotly_dark",
+                height=420,
+                xaxis_title="Forecast Horizon (bars ahead)",
+                yaxis_title="Probability (%)",
+                yaxis=dict(range=[0, 100]),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                hovermode="x unified",
+            )
+            st.plotly_chart(fig_fc, use_container_width=True)
+
+            # ── Regime Shift Probability ──
+            st.subheader("Regime Shift Probability")
+            st.caption("Probability of leaving the current regime within N bars")
+
+            shift_horizons = list(summary["shift_probs"].keys())
+            shift_vals = [summary["shift_probs"][h] * 100 for h in shift_horizons]
+
+            fig_shift = go.Figure()
+            fig_shift.add_trace(go.Bar(
+                x=[str(h) for h in shift_horizons],
+                y=shift_vals,
+                marker_color=["#00e599" if v < 30 else "#f59e0b" if v < 60 else "#ef4444"
+                              for v in shift_vals],
+                text=[f"{v:.1f}%" for v in shift_vals],
+                textposition="outside",
+            ))
+            fig_shift.update_layout(
+                template="plotly_dark",
+                height=320,
+                xaxis_title="Horizon (bars)",
+                yaxis_title="Shift Probability (%)",
+                yaxis=dict(range=[0, 105]),
+            )
+            st.plotly_chart(fig_shift, use_container_width=True)
+
+            # ── Most Likely Next Regime ──
+            st.subheader("Most Likely Next Regime (upon exit)")
+            next_regs = summary["next_regimes"]
+            if next_regs:
+                nr_cols = st.columns(len(next_regs))
+                for i, nr in enumerate(next_regs):
+                    with nr_cols[i]:
+                        color = regime_plot_colors.get(nr["label"], "#888")
+                        st.markdown(
+                            f"<div style='text-align:center; padding:1rem; "
+                            f"border:2px solid {color}; border-radius:8px;'>"
+                            f"<div style='font-size:1.5rem; font-weight:bold; color:{color};'>"
+                            f"{nr['label'].upper()}</div>"
+                            f"<div style='font-size:2rem; margin-top:0.5rem;'>"
+                            f"{nr['probability']:.1%}</div>"
+                            f"<div style='color:#64748b; font-size:0.8rem;'>transition probability</div>"
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
+            else:
+                st.info("No significant exit transitions detected.")
+
+            # ── Macro Dashboard (if enabled) ──
+            if macro_stress is not None and macro_features_df is not None:
+                st.markdown("---")
+                st.subheader("Cross-Asset Macro Dashboard")
+
+                # Current macro regime
+                if macro_labels_map and macro_post is not None:
+                    macro_state = int(np.argmax(macro_post))
+                    macro_regime = macro_labels_map.get(macro_state, "unknown")
+                    macro_conf = float(macro_post[macro_state])
+
+                    mc1, mc2, mc3 = st.columns(3)
+                    with mc1:
+                        macro_color = {"risk_on": "#00e599", "neutral": "#f59e0b",
+                                       "risk_off": "#ef4444"}.get(macro_regime, "#888")
+                        st.metric("Macro Regime", macro_regime.upper().replace("_", " "))
+                    with mc2:
+                        st.metric("Macro Confidence", f"{macro_conf:.1%}")
+                    with mc3:
+                        current_stress = float(macro_stress.iloc[-1])
+                        stress_label = "LOW" if current_stress < -0.5 else "HIGH" if current_stress > 0.5 else "MODERATE"
+                        st.metric("Stress Level", stress_label, f"{current_stress:+.2f}")
+
+                # Macro stress time series
+                fig_stress = go.Figure()
+                fig_stress.add_trace(go.Scatter(
+                    x=macro_stress.index, y=macro_stress.values,
+                    mode="lines", name="Macro Stress Index",
+                    line=dict(color="#f59e0b", width=2),
+                    fill="tonexty" if False else None,
+                ))
+                fig_stress.add_hline(y=0.5, line_dash="dash", line_color="#ef4444",
+                                     annotation_text="High Stress")
+                fig_stress.add_hline(y=-0.5, line_dash="dash", line_color="#00e599",
+                                     annotation_text="Low Stress")
+                fig_stress.update_layout(
+                    template="plotly_dark", height=300,
+                    xaxis_title="Date", yaxis_title="Stress Index (z-score)",
+                    title="Composite Macro Stress Index",
+                )
+                st.plotly_chart(fig_stress, use_container_width=True)
+
+                # Individual macro features
+                st.subheader("Macro Leading Indicators")
+                macro_display_cols = [c for c in macro_features_df.columns if c in [
+                    "vix_level", "vix_change", "yield_level", "credit_spread",
+                    "usd_momentum", "gold_momentum"
+                ]]
+                if macro_display_cols:
+                    n_indicator_cols = min(len(macro_display_cols), 3)
+                    indicator_rows = (len(macro_display_cols) + n_indicator_cols - 1) // n_indicator_cols
+                    for row_i in range(indicator_rows):
+                        cols = st.columns(n_indicator_cols)
+                        for col_i in range(n_indicator_cols):
+                            idx = row_i * n_indicator_cols + col_i
+                            if idx < len(macro_display_cols):
+                                col_name = macro_display_cols[idx]
+                                with cols[col_i]:
+                                    fig_ind = go.Figure()
+                                    series = macro_features_df[col_name].dropna().tail(90)
+                                    fig_ind.add_trace(go.Scatter(
+                                        x=series.index, y=series.values,
+                                        mode="lines",
+                                        line=dict(color="#3b82f6", width=1.5),
+                                    ))
+                                    fig_ind.update_layout(
+                                        template="plotly_dark", height=200,
+                                        title=col_name.replace("_", " ").title(),
+                                        margin=dict(l=30, r=10, t=40, b=30),
+                                        showlegend=False,
+                                    )
+                                    st.plotly_chart(fig_ind, use_container_width=True)
+
+            # ── Forecast Summary Table ──
+            st.markdown("---")
+            st.subheader("Forecast Summary Table")
+            fc_rows = []
+            for fc in summary["forecasts"]:
+                row = {
+                    "Horizon": f"+{fc['horizon']} bars",
+                    "Dominant Regime": fc["dominant_regime"],
+                    "Dominant Prob": f"{fc['dominant_prob']:.1%}",
+                    "Shift Prob": f"{fc['shift_prob']:.1%}",
+                }
+                for regime, prob in fc["probs"].items():
+                    row[regime] = f"{prob:.1%}"
+                fc_rows.append(row)
+            st.dataframe(pd.DataFrame(fc_rows), use_container_width=True)
 
 else:
     # ── Landing Page ─────────────────────────────────────────────────────
