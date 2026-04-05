@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from data_loader import standardize, get_feature_matrix
 from hmm_engine import RegimeDetector
 from strategy import SignalGenerator
+from adaptive_strategy import AdaptiveStrategyEngine
 from regime_analyzer import RegimeTransitionAnalyzer
 
 
@@ -62,6 +63,7 @@ class WalkForwardBacktester:
             "features",
             ["log_return", "rolling_vol", "volume_change", "intraday_range", "rsi"],
         )
+        self.use_adaptive = config.get("adaptive_strategy", {}).get("enabled", False)
 
     def run(self, df: pd.DataFrame) -> BacktestResult:
         """
@@ -112,24 +114,35 @@ class WalkForwardBacktester:
             labels = detector.label_regimes(X_test)
             entropy, confidence = detector.shannon_entropy(posteriors)
 
-            # Generate signals
-            sig_gen = SignalGenerator(self.config)
-            test_with_conf = sig_gen.compute_confirmations(test_df)
-            signals = sig_gen.generate_signals(
-                test_with_conf, states, posteriors, labels, confidence
-            )
-
-            # Position sizing
-            sizes = pd.Series(0.0, index=test_df.index)
-            for i in range(len(test_df)):
-                sizes.iloc[i] = sig_gen.compute_position_size(confidence[i])
+            # Generate signals — adaptive or classic
+            if self.use_adaptive:
+                adaptive_engine = AdaptiveStrategyEngine(self.config)
+                adaptive_sigs = adaptive_engine.generate_adaptive_signals(
+                    test_df, states, posteriors, labels, confidence, entropy
+                )
+                signals, sizes, regime_labels = adaptive_engine.signals_to_series(
+                    adaptive_sigs, test_df.index
+                )
+            else:
+                sig_gen = SignalGenerator(self.config)
+                test_with_conf = sig_gen.compute_confirmations(test_df)
+                signals = sig_gen.generate_signals(
+                    test_with_conf, states, posteriors, labels, confidence
+                )
+                sizes = pd.Series(0.0, index=test_df.index)
+                for i in range(len(test_df)):
+                    sizes.iloc[i] = sig_gen.compute_position_size(confidence[i])
+                regime_labels = None
 
             # Store results for this fold
             idx = test_df.index
             all_signals.loc[idx] = signals.values
             all_sizes.loc[idx] = sizes.values
-            for i, s in enumerate(states):
-                all_regimes.iloc[train_end + i] = labels.get(s, "unknown")
+            if regime_labels is not None:
+                all_regimes.loc[idx] = regime_labels.values
+            else:
+                for i, s in enumerate(states):
+                    all_regimes.iloc[train_end + i] = labels.get(s, "unknown")
             all_confidence.loc[idx] = confidence
 
             start += self.step_bars

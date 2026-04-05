@@ -16,6 +16,7 @@ import yaml
 from data_loader import fetch_ohlcv, compute_features, standardize, get_feature_matrix
 from hmm_engine import RegimeDetector
 from strategy import SignalGenerator
+from adaptive_strategy import AdaptiveStrategyEngine
 from backtester import WalkForwardBacktester
 from fundamentals import FundamentalAnalyzer
 from regime_analyzer import RegimeTransitionAnalyzer
@@ -533,10 +534,10 @@ if run_btn:
 
     # ── Tabs ─────────────────────────────────────────────────────────────
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "Current Signal", "Regime Analysis", "Regime Transitions",
         "Backtest Results", "Trade Log", "Model Diagnostics", "Fundamentals",
-        "Multi-Timeframe", "Monte Carlo",
+        "Multi-Timeframe", "Monte Carlo", "Adaptive Strategy",
     ])
 
     # ── Tab 1: Current Signal ────────────────────────────────────────────
@@ -1720,6 +1721,191 @@ if run_btn:
                             st.metric("VaR (95%)", f"{sr.var_95:+.2%}")
                         with sc_col3:
                             st.metric("Worst MDD", f"{sr.max_drawdowns.min():.2%}")
+
+    # ── Tab 10: Adaptive Strategy ──────────────────────────────────────
+
+    with tab10:
+        st.subheader("Regime-Adaptive Strategy Engine")
+        st.caption(
+            "Posterior-probability-weighted blending of regime-specific playbooks. "
+            "Instead of one strategy for all regimes, each regime gets its own "
+            "signal logic, confirmation thresholds, and risk parameters — blended "
+            "smoothly by HMM posteriors to avoid whipsaw switching."
+        )
+
+        # Controls
+        ada_col1, ada_col2, ada_col3 = st.columns(3)
+        with ada_col1:
+            ada_blending = st.checkbox("Posterior Blending", value=True, key="ada_blend",
+                                       help="Blend playbook signals by posterior probabilities")
+        with ada_col2:
+            ada_temperature = st.slider("Blend Temperature", 0.1, 3.0, 1.0, 0.1,
+                                        key="ada_temp",
+                                        help="<1 sharpens, >1 softens blend")
+        with ada_col3:
+            ada_threshold = st.slider("Entry Threshold", 0.1, 0.5, 0.25, 0.05,
+                                      key="ada_thresh",
+                                      help="Blended signal must exceed this to enter")
+
+        ada_run = st.button("Run Adaptive Strategy", type="primary", key="ada_run")
+
+        if ada_run:
+            with st.spinner("Running regime-adaptive strategy..."):
+                ada_config = config.copy()
+                ada_config["adaptive_strategy"] = {
+                    "enabled": True,
+                    "use_blending": ada_blending,
+                    "blend_temperature": ada_temperature,
+                    "discretization_threshold": ada_threshold,
+                    "atr_period": 14,
+                    "time_decay_start": 0.7,
+                    "entropy_exit_threshold": 0.85,
+                    "max_entropy_bars": 5,
+                    "cooldown_bars": 3,
+                    "min_hold_bars": 5,
+                }
+
+                ada_engine = AdaptiveStrategyEngine(ada_config)
+                ada_signals = ada_engine.generate_adaptive_signals(
+                    df, states, posteriors, labels, confidence, entropy
+                )
+
+            # Diagnostics dataframe
+            diag = ada_engine.get_blend_diagnostics(ada_signals)
+            diag.index = df.index
+
+            # ── Signal Overview ──
+            st.markdown("---")
+            st.subheader("Adaptive Signal vs Classic Signal")
+
+            fig_cmp = make_subplots(
+                rows=3, cols=1, shared_xaxes=True,
+                row_heights=[0.5, 0.25, 0.25],
+                subplot_titles=("Price + Adaptive Regimes", "Classic vs Adaptive Signal", "Blend Confidence"),
+                vertical_spacing=0.06,
+            )
+
+            # Price with regime coloring
+            regime_colors = {
+                "bull": "#00e599", "bull_run": "#00e599",
+                "bear": "#ef4444", "crash": "#ff6b6b",
+                "neutral": "#f59e0b",
+            }
+            for regime_name, color in regime_colors.items():
+                mask = diag["dominant_regime"] == regime_name
+                if mask.any():
+                    fig_cmp.add_trace(go.Scatter(
+                        x=df.index[mask], y=df["Close"][mask],
+                        mode="markers", marker=dict(color=color, size=3),
+                        name=f"{regime_name}", legendgroup=regime_name,
+                    ), row=1, col=1)
+
+            fig_cmp.add_trace(go.Scatter(
+                x=df.index, y=df["Close"], mode="lines",
+                line=dict(color="rgba(255,255,255,0.3)", width=1),
+                name="Price", showlegend=False,
+            ), row=1, col=1)
+
+            # Classic vs adaptive signals
+            fig_cmp.add_trace(go.Scatter(
+                x=df.index, y=df["signal"],
+                mode="lines", name="Classic Signal",
+                line=dict(color="#3b82f6", width=1.5),
+            ), row=2, col=1)
+            fig_cmp.add_trace(go.Scatter(
+                x=df.index, y=diag["position"],
+                mode="lines", name="Adaptive Signal",
+                line=dict(color="#00e599", width=1.5),
+            ), row=2, col=1)
+
+            # Raw blend (continuous)
+            fig_cmp.add_trace(go.Scatter(
+                x=df.index, y=diag["raw_blend"],
+                mode="lines", name="Raw Blend",
+                line=dict(color="#06b6d4", width=1),
+                opacity=0.6,
+            ), row=2, col=1)
+
+            # Blend confidence
+            fig_cmp.add_trace(go.Scatter(
+                x=df.index, y=diag["blend_confidence"],
+                mode="lines", name="Blend Confidence",
+                line=dict(color="#f59e0b", width=1.5),
+                fill="tozeroy", fillcolor="rgba(245, 158, 11, 0.1)",
+            ), row=3, col=1)
+
+            fig_cmp.update_layout(
+                template="plotly_dark", height=700,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            )
+            st.plotly_chart(fig_cmp, use_container_width=True)
+
+            # ── Exit Reason Breakdown ──
+            st.markdown("---")
+            col_exit, col_regime = st.columns(2)
+
+            with col_exit:
+                st.subheader("Exit Reason Breakdown")
+                exit_reasons = ada_engine.get_exit_reasons(ada_signals)
+                if exit_reasons:
+                    fig_exit = go.Figure(go.Bar(
+                        x=list(exit_reasons.keys()),
+                        y=list(exit_reasons.values()),
+                        marker_color=["#ef4444" if "stop" in k else "#f59e0b" if "entropy" in k
+                                      else "#3b82f6" for k in exit_reasons],
+                    ))
+                    fig_exit.update_layout(
+                        template="plotly_dark", height=300,
+                        xaxis_title="Exit Reason", yaxis_title="Count",
+                    )
+                    st.plotly_chart(fig_exit, use_container_width=True)
+                else:
+                    st.info("No exits triggered in this period.")
+
+            with col_regime:
+                st.subheader("Time in Each Regime")
+                regime_counts = diag["dominant_regime"].value_counts()
+                fig_pie = go.Figure(go.Pie(
+                    labels=regime_counts.index,
+                    values=regime_counts.values,
+                    marker_colors=[regime_colors.get(r, "#64748b") for r in regime_counts.index],
+                    hole=0.4,
+                ))
+                fig_pie.update_layout(template="plotly_dark", height=300)
+                st.plotly_chart(fig_pie, use_container_width=True)
+
+            # ── Position Sizing Over Time ──
+            st.markdown("---")
+            st.subheader("Adaptive Position Sizing")
+            fig_size = go.Figure()
+            fig_size.add_trace(go.Scatter(
+                x=df.index, y=diag["size"],
+                mode="lines", name="Position Size",
+                fill="tozeroy", fillcolor="rgba(0, 229, 153, 0.1)",
+                line=dict(color="#00e599", width=1.5),
+            ))
+            fig_size.update_layout(
+                template="plotly_dark", height=250,
+                xaxis_title="Time", yaxis_title="Size (fraction of equity)",
+            )
+            st.plotly_chart(fig_size, use_container_width=True)
+
+            # ── Playbook Summary Table ──
+            st.markdown("---")
+            st.subheader("Active Playbook Parameters")
+            playbook_rows = []
+            for name, pb in ada_engine.playbooks.items():
+                playbook_rows.append({
+                    "Regime": name,
+                    "Bias": {1: "Long", -1: "Short", 0: "Flat"}.get(pb.bias, "?"),
+                    "Min Confirmations": pb.min_confirmations,
+                    "Min Confidence": f"{pb.min_confidence:.0%}",
+                    "Kelly Multiplier": f"{pb.kelly_multiplier:.1f}x",
+                    "Trailing ATR": f"{pb.trailing_atr_multiplier:.1f}x",
+                    "Max Hold (bars)": pb.max_hold_bars,
+                    "Entry Aggression": f"{pb.entry_aggression:.0%}",
+                })
+            st.dataframe(pd.DataFrame(playbook_rows), use_container_width=True)
 
 else:
     # ── Landing Page ─────────────────────────────────────────────────────

@@ -69,6 +69,32 @@ monte_carlo:
   ruin_threshold: 0.5              # equity fraction defining ruin (50% loss)
   seed: 42                         # reproducibility
 
+adaptive_strategy:
+  enabled: true                    # use adaptive engine instead of base SignalGenerator
+  use_blending: true               # posterior-weighted blending (false = hard regime switch)
+  blend_temperature: 1.0           # <1 sharpens blend, >1 softens (1.0 = raw posteriors)
+  discretization_threshold: 0.25   # |blended signal| must exceed this to enter
+  atr_period: 14                   # ATR window for trailing stops
+  time_decay_start: 0.7            # fraction of max_hold before position decay begins
+  entropy_exit_threshold: 0.85     # entropy above this counts toward de-risk trigger
+  max_entropy_bars: 5              # consecutive high-entropy bars before forced exit
+  cooldown_bars: 3
+  min_hold_bars: 5
+  playbooks:                       # per-regime overrides (omit to use defaults)
+    bull:
+      min_confirmations: 3
+      kelly_multiplier: 1.0
+      trailing_atr_multiplier: 2.5
+    bear:
+      min_confirmations: 5
+      kelly_multiplier: 0.6
+      trailing_atr_multiplier: 1.5
+    crash:
+      kelly_multiplier: 0.0        # no new positions in crash
+    neutral:
+      min_confirmations: 5
+      kelly_multiplier: 0.4
+
 backtest:
   train_window_bars: 500
   test_window_bars: 100
