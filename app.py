@@ -1,8 +1,9 @@
 """
-app.py — Streamlit dashboard with 6 tabs for HMM Regime Terminal.
+app.py — Streamlit dashboard for HMM Regime Terminal.
 
-Tabs: Current Signal, Regime Analysis, Backtest Results, Trade Log,
-      Model Diagnostics, Fundamentals.
+Tabs: Current Signal, Regime Analysis, Regime Transitions, Backtest Results,
+      Trade Log, Model Diagnostics, Fundamentals, Multi-Timeframe,
+      Monte Carlo, Optimal Policy.
 """
 
 import streamlit as st
@@ -21,6 +22,15 @@ from fundamentals import FundamentalAnalyzer
 from regime_analyzer import RegimeTransitionAnalyzer
 from multi_timeframe import run_multi_timeframe_analysis, TIMEFRAME_ORDER, DEFAULT_WEIGHTS
 from monte_carlo import MonteCarloEngine
+from regime_mdp import (
+    bellman_optimal_policy,
+    evaluate_fixed_policy,
+    expected_hitting_times,
+    expected_return_path,
+    forecast_regime_distribution,
+    mixing_time,
+    stationary_distribution,
+)
 
 # ── Page config ──────────────────────────────────────────────────────────────
 
@@ -533,10 +543,10 @@ if run_btn:
 
     # ── Tabs ─────────────────────────────────────────────────────────────
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "Current Signal", "Regime Analysis", "Regime Transitions",
         "Backtest Results", "Trade Log", "Model Diagnostics", "Fundamentals",
-        "Multi-Timeframe", "Monte Carlo",
+        "Multi-Timeframe", "Monte Carlo", "Optimal Policy",
     ])
 
     # ── Tab 1: Current Signal ────────────────────────────────────────────
@@ -1720,6 +1730,287 @@ if run_btn:
                             st.metric("VaR (95%)", f"{sr.var_95:+.2%}")
                         with sc_col3:
                             st.metric("Worst MDD", f"{sr.max_drawdowns.min():.2%}")
+
+    # ── Tab 10: Optimal Policy (Regime MDP) ───────────────────────────────
+
+    with tab10:
+        st.subheader("Regime MDP — Forecast & Optimal Policy")
+        st.caption(
+            "Closed-form analytical companion to Monte Carlo. Treats the fitted "
+            "HMM as a Markov decision process to compute the theoretically "
+            "optimal long/flat/short policy under transaction costs, plus "
+            "n-step regime forecasts and first-passage hitting times."
+        )
+
+        # ---- controls ----
+        op_c1, op_c2, op_c3, op_c4 = st.columns(4)
+        with op_c1:
+            mdp_horizon = st.number_input(
+                "Forecast Horizon (bars)", 5, 200, 30, step=5, key="mdp_horizon"
+            )
+        with op_c2:
+            mdp_risk_aversion = st.slider(
+                "Risk Aversion (λ)", 0.0, 5.0, 1.0, 0.1, key="mdp_lambda",
+                help="Mean-variance utility coefficient. Higher = more conservative."
+            )
+        with op_c3:
+            mdp_cost_bps = st.slider(
+                "Cost per Trade (bps)", 0.0, 50.0, 5.0, 0.5, key="mdp_cost",
+                help="Proportional friction charged per unit of |Δposition|."
+            )
+        with op_c4:
+            mdp_gamma = st.slider(
+                "Discount γ", 0.80, 0.999, 0.99, 0.001, key="mdp_gamma"
+            )
+
+        # ---- pull HMM emission stats (in *standardized* feature space) ----
+        # Column 0 of features is log_return, but features are standardized.
+        # We rescale back to raw return units using the standardization stats.
+        ret_mean = float(stats["log_return"]["mean"])
+        ret_std = float(stats["log_return"]["std"])
+        regime_means_raw = detector.model.means_[:, 0] * ret_std + ret_mean
+        if detector.covariance_type == "full":
+            regime_vars_raw = detector.model.covars_[:, 0, 0] * (ret_std ** 2)
+        elif detector.covariance_type == "diag":
+            regime_vars_raw = detector.model.covars_[:, 0] * (ret_std ** 2)
+        elif detector.covariance_type == "spherical":
+            regime_vars_raw = np.array(detector.model.covars_) * (ret_std ** 2)
+        else:  # tied
+            regime_vars_raw = np.full(detector.n_states, detector.model.covars_[0, 0] * (ret_std ** 2))
+
+        regime_label_list = [labels.get(i, f"S{i}") for i in range(detector.n_states)]
+
+        # current posterior (last bar)
+        pi_now = posteriors[-1]
+
+        # Bars-per-year heuristic from interval
+        bpy_map = {"1m": 252 * 390, "5m": 252 * 78, "15m": 252 * 26,
+                   "30m": 252 * 13, "1h": 252 * 6.5, "1d": 252,
+                   "1wk": 52, "1mo": 12}
+        bars_per_year = bpy_map.get(interval, 252)
+
+        # ---- 1. Analytical regime probability fan chart ----
+        st.markdown("#### Forward Regime Probability Forecast")
+        st.caption(r"$\pi_{t+k} = \pi_t \cdot A^k$ — closed form, no simulation.")
+
+        pi_path = forecast_regime_distribution(pi_now, transmat, horizon=int(mdp_horizon))
+        steps = np.arange(pi_path.shape[0])
+
+        fig_fan = go.Figure()
+        for i in range(detector.n_states):
+            fig_fan.add_trace(go.Scatter(
+                x=steps, y=pi_path[:, i],
+                mode="lines",
+                name=regime_label_list[i],
+                stackgroup="one",
+                line=dict(color=get_regime_color(regime_label_list[i]), width=0.5),
+            ))
+        fig_fan.update_layout(
+            template="plotly_dark", height=320,
+            xaxis_title="Bars ahead",
+            yaxis_title="P(regime)",
+            yaxis=dict(range=[0, 1]),
+            legend=dict(orientation="h", y=-0.2),
+        )
+        st.plotly_chart(fig_fan, use_container_width=True)
+
+        # ---- 2. Expected return cone ----
+        st.markdown("#### Expected Return Cone")
+        st.caption(
+            "Per-bar expected return and Gaussian-mixture quantile bands derived "
+            "analytically from the regime forecast above."
+        )
+        ret_path = expected_return_path(
+            pi_path, regime_means_raw, regime_vars_raw,
+            quantiles=(0.05, 0.25, 0.5, 0.75, 0.95),
+        )
+        fig_cone = go.Figure()
+        fig_cone.add_trace(go.Scatter(
+            x=steps, y=ret_path["q95"], mode="lines",
+            line=dict(color="rgba(34,197,94,0.0)"), showlegend=False,
+        ))
+        fig_cone.add_trace(go.Scatter(
+            x=steps, y=ret_path["q05"], mode="lines",
+            fill="tonexty", fillcolor="rgba(34,197,94,0.15)",
+            line=dict(color="rgba(34,197,94,0.0)"), name="5–95%",
+        ))
+        fig_cone.add_trace(go.Scatter(
+            x=steps, y=ret_path["q75"], mode="lines",
+            line=dict(color="rgba(34,197,94,0.0)"), showlegend=False,
+        ))
+        fig_cone.add_trace(go.Scatter(
+            x=steps, y=ret_path["q25"], mode="lines",
+            fill="tonexty", fillcolor="rgba(34,197,94,0.30)",
+            line=dict(color="rgba(34,197,94,0.0)"), name="25–75%",
+        ))
+        fig_cone.add_trace(go.Scatter(
+            x=steps, y=ret_path["mean"], mode="lines",
+            line=dict(color="#22c55e", width=2), name="E[r]",
+        ))
+        fig_cone.add_hline(y=0.0, line_dash="dot", line_color="#64748b")
+        fig_cone.update_layout(
+            template="plotly_dark", height=300,
+            xaxis_title="Bars ahead",
+            yaxis_title="Per-bar return",
+            legend=dict(orientation="h", y=-0.2),
+        )
+        st.plotly_chart(fig_cone, use_container_width=True)
+
+        cum_mean = float(np.sum(ret_path["mean"][1:]))
+        cum_std = float(np.sqrt(np.sum(ret_path["std"][1:] ** 2)))
+        cc1, cc2, cc3 = st.columns(3)
+        with cc1:
+            st.metric(f"Cumulative E[r] ({int(mdp_horizon)} bars)",
+                      f"{cum_mean*100:+.2f}%")
+        with cc2:
+            st.metric("Cumulative σ", f"{cum_std*100:.2f}%")
+        with cc3:
+            sr_h = (cum_mean / cum_std) if cum_std > 0 else 0.0
+            st.metric("Forecast info ratio", f"{sr_h:+.2f}")
+
+        # ---- 3. Hitting times & mixing diagnostics ----
+        st.markdown("#### First-Passage Hitting Times & Mixing")
+        st.caption(
+            "$E[T_{ij}]$ = expected bars from regime $i$ until first arriving in "
+            "regime $j$, computed via the fundamental matrix $(I-Q)^{-1}$. "
+            "Diagonal entries are mean recurrence times $1/\\pi_i$."
+        )
+
+        H = expected_hitting_times(transmat)
+        H_df = pd.DataFrame(
+            H, index=[f"from {l}" for l in regime_label_list],
+            columns=[f"to {l}" for l in regime_label_list],
+        )
+        st.dataframe(H_df.round(1), use_container_width=True)
+
+        mt_info = mixing_time(transmat)
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.metric("|λ₂|", f"{mt_info['lambda2']:.4f}")
+        with m2:
+            st.metric("Spectral gap", f"{mt_info['spectral_gap']:.4f}")
+        with m3:
+            hl = mt_info["half_life"]
+            st.metric("Chain half-life", f"{hl:.1f} bars" if np.isfinite(hl) else "∞")
+        with m4:
+            mt_v = mt_info["mixing_time"]
+            st.metric("Mixing time τ", f"{mt_v:.1f} bars" if np.isfinite(mt_v) else "∞")
+
+        # ---- 4. Bellman optimal policy ----
+        st.markdown("#### Bellman Optimal Policy")
+        st.caption(
+            "Solves the regime MDP with state $(r, a_{t-1})$, action "
+            "$a \\in \\{-1, 0, +1\\}$, reward "
+            "$a\\mu_r - \\tfrac12\\lambda a^2 \\sigma_r^2 - c|a - a_{t-1}|$, "
+            "and Bellman equation "
+            "$V(r,a_{t-1}) = \\max_a [\\,R + \\gamma \\sum_{r'} A_{rr'} V(r', a)\\,]$."
+        )
+
+        sol = bellman_optimal_policy(
+            transmat, regime_means_raw, regime_vars_raw,
+            actions=(-1.0, 0.0, 1.0),
+            risk_aversion=float(mdp_risk_aversion),
+            cost=float(mdp_cost_bps) / 1e4,
+            gamma=float(mdp_gamma),
+            bars_per_year=float(bars_per_year),
+        )
+
+        # Build readable table: regime | mu | sigma | optimal action | V(r, flat)
+        action_names = {-1.0: "SHORT", 0.0: "FLAT", 1.0: "LONG"}
+        flat_idx = int(np.argmin(np.abs(sol.actions)))
+        rows = []
+        for r in range(detector.n_states):
+            rows.append({
+                "Regime": regime_label_list[r],
+                "μ (per bar)": f"{regime_means_raw[r]*100:+.3f}%",
+                "σ (per bar)": f"{np.sqrt(regime_vars_raw[r])*100:.3f}%",
+                "Optimal Action": action_names.get(float(sol.stationary_policy[r]),
+                                                   f"{sol.stationary_policy[r]:+.0f}"),
+                "V(r, flat)": f"{sol.V[r, flat_idx]:+.4f}",
+                "Stationary π": f"{stationary_distribution(transmat)[r]:.2%}",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        # Compare optimal vs naive long-only and "follow regime sign"
+        long_only = evaluate_fixed_policy(
+            transmat, regime_means_raw, regime_vars_raw,
+            policy=np.ones(detector.n_states), bars_per_year=float(bars_per_year),
+        )
+        sign_policy = np.sign(regime_means_raw)
+        sign_eval = evaluate_fixed_policy(
+            transmat, regime_means_raw, regime_vars_raw,
+            policy=sign_policy, bars_per_year=float(bars_per_year),
+        )
+
+        s1, s2, s3, s4 = st.columns(4)
+        with s1:
+            st.metric("Optimal Sharpe (ann.)", f"{sol.theoretical_sharpe:+.2f}")
+        with s2:
+            st.metric("Long-only Sharpe", f"{long_only['annualized_sharpe']:+.2f}")
+        with s3:
+            st.metric("Sign(μ) Sharpe", f"{sign_eval['annualized_sharpe']:+.2f}")
+        with s4:
+            current_action = action_names.get(
+                float(sol.stationary_policy[states[-1]]),
+                f"{sol.stationary_policy[states[-1]]:+.0f}",
+            )
+            st.metric("Action for current regime", current_action)
+
+        # Q-value heatmap for the most likely current regime
+        cur_r = int(states[-1])
+        st.markdown(
+            f"##### Q-values for current regime: **{regime_label_list[cur_r]}**"
+        )
+        st.caption(
+            "Q[a_prev, a_new] = immediate reward + discounted future value. "
+            "The argmax across each row is the optimal next action given the "
+            "previous position."
+        )
+        Q_df = pd.DataFrame(
+            sol.Q[cur_r],
+            index=[f"prev={action_names[float(a)]}" for a in sol.actions],
+            columns=[f"next={action_names[float(a)]}" for a in sol.actions],
+        )
+        fig_q = px.imshow(
+            Q_df.values, x=list(Q_df.columns), y=list(Q_df.index),
+            color_continuous_scale="RdYlGn", aspect="auto",
+            text_auto=".4f",
+        )
+        fig_q.update_layout(template="plotly_dark", height=320)
+        st.plotly_chart(fig_q, use_container_width=True)
+
+        with st.expander("Math reference"):
+            st.markdown(
+                """
+                **Forecast.** Given current regime posterior $\\pi_t$ and the
+                fitted transition matrix $A$, the $k$-step forecast is the exact
+                closed form $\\pi_{t+k} = \\pi_t A^k$. No sampling, no variance
+                from finite paths.
+
+                **Per-bar moments.** The forecast distribution induces a regime
+                mixture over returns: $E[r_k] = \\pi_{t+k}\\cdot\\mu$ and
+                $\\mathrm{Var}[r_k] = \\pi_{t+k}\\cdot(\\mu^2 + \\sigma^2)
+                - E[r_k]^2$.
+
+                **First-passage times.** Removing the target row/column $j$ from
+                $A$ gives the transient submatrix $Q$; the fundamental matrix
+                $N=(I-Q)^{-1}$ has row sums equal to expected absorption times,
+                so $E[T_{ij}] = (N\\mathbf{1})_i$. Diagonal entries use the
+                Kac formula $E[T_{ii}]=1/\\pi_i$.
+
+                **Mixing.** The chain converges to $\\pi$ at rate $|\\lambda_2|$.
+                The half-life is $\\log 0.5 / \\log|\\lambda_2|$ bars; the
+                $\\sim 63\\%$ mixing time is $1/(1-|\\lambda_2|)$.
+
+                **Bellman MDP.** State is $(r, a_{t-1})$, action $a$, reward
+                $a\\mu_r - \\tfrac12\\lambda a^2 \\sigma_r^2 - c|a-a_{t-1}|$.
+                The optimal value satisfies
+                $V(r,a_{t-1})=\\max_a\\big[R + \\gamma\\sum_{r'}A_{rr'}V(r',a)\\big]$,
+                solved by value iteration. The annualized Sharpe of the
+                optimal policy is reported as the **theoretical ceiling** any
+                strategy operating purely on regime state could attain.
+                """
+            )
 
 else:
     # ── Landing Page ─────────────────────────────────────────────────────
